@@ -481,6 +481,47 @@ using a fortran linker.
   </LDFLAGS>
 </compiler>
 
+<compiler MACH="archer2">
+  <MPICC> cc  </MPICC>
+  <MPICXX> CC </MPICXX>
+  <MPIFC> ftn </MPIFC>
+  <SCC> cc </SCC>
+  <SCXX> CC </SCXX>
+  <SFC> ftn </SFC>
+
+  <PIO_FILESYSTEM_HINTS>lustre</PIO_FILESYSTEM_HINTS>
+  <NETCDF_PATH>$ENV{NETCDF_PREFIX}</NETCDF_PATH>
+  <PNETCDF_PATH  MPILIB="mpich">$ENV{PNETCDF_PREFIX}</PNETCDF_PATH>
+
+  <LDFLAGS>
+     <append MPILIB="mpich"> -dynamic -L${NETCDF_PATH}/lib -lnetcdff -lnetcdf  -Wl,-rpath,${NETCDF_PATH}/lib </append>
+     <append MPILIB="mpich"> -L${PNETCDF_PATH}/lib -lpnetcdf -Wl,-rpath,${PNETCDF_PATH}/lib </append>
+  </LDFLAGS>
+
+  <SLIBS>
+     <append MPILIB="mpi-serial"> -L${NETCDF_PATH}/lib -lnetcdff -lnetcdf -Wl,-rpath,${NETCDF_PATH}/lib </append>
+  </SLIBS>
+<!--
+  <SLIBS>
+some of above SLIBS might be superfluous.
+   <append> -Wl,-rpath,${NETCDF_PATH}/lib </append>
+  </SLIBS>
+-->
+</compiler>
+
+<compiler MACH="archer2" COMPILER="gnu">
+  <FFLAGS>
+    <append>  -mcmodel=medium -std=legacy -fcray-pointer -fallow-argument-mismatch -march=znver2 </append>
+    <append>  -fallow-invalid-boz -fconvert=big-endian -fconvert=big-endian -ffree-line-length-none -ffixed-line-length-none</append>
+  </FFLAGS>
+  <CFLAGS>
+    <append>  -mcmodel=medium -march=znver2 </append>
+  </CFLAGS>
+   <SLIBS>
+    <append> -ldl </append>
+  </SLIBS>
+</compiler>
+
 <compiler MACH="athena">
   <CPPDEFS>
     <!-- these flags enable nano timers -->
