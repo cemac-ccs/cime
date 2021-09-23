@@ -6,10 +6,15 @@ case_setup is a member of class Case from file case.py
 from CIME.XML.standard_module_setup import *
 
 from CIME.XML.machines      import Machines
-from CIME.BuildTools.configure import configure
-from CIME.utils             import get_cime_root, run_and_log_case_status, get_model, get_batch_script_for_job, safe_copy
+from CIME.BuildTools.configure import configure, generate_env_mach_specific, copy_depends_files
+from CIME.utils             import run_and_log_case_status, get_model, \
+    get_batch_script_for_job, safe_copy, file_contains_python_function, import_from_file
+from CIME.utils             import batch_jobid
+from CIME.utils             import transform_vars
 from CIME.test_status       import *
 from CIME.locked_files      import unlock_file, lock_file
+
+import errno, shutil
 
 logger = logging.getLogger(__name__)
 
@@ -30,76 +35,191 @@ def _build_usernl_files(case, model, comp):
 
     expect(os.path.isdir(model_dir),
            "cannot find cime_config directory {} for component {}".format(model_dir, comp))
-    ninst = 1
+    comp_interface = case.get_value("COMP_INTERFACE")
     multi_driver = case.get_value("MULTI_DRIVER")
+    ninst = 1
+
     if multi_driver:
         ninst_max = case.get_value("NINST_MAX")
-        if model not in ("DRV","CPL","ESP"):
+        if comp_interface != "nuopc" and model not in ("DRV","CPL","ESP"):
             ninst_model = case.get_value("NINST_{}".format(model))
             expect(ninst_model==ninst_max,"MULTI_DRIVER mode, all components must have same NINST value.  NINST_{} != {}".format(model,ninst_max))
     if comp == "cpl":
         if not os.path.exists("user_nl_cpl"):
             safe_copy(os.path.join(model_dir, "user_nl_cpl"), ".")
     else:
-        if ninst == 1:
+        if comp_interface == "nuopc":
+            ninst = case.get_value("NINST")
+        elif ninst == 1:
             ninst = case.get_value("NINST_{}".format(model))
-        nlfile = "user_nl_{}".format(comp)
-        model_nl = os.path.join(model_dir, nlfile)
-        if ninst > 1:
-            for inst_counter in range(1, ninst+1):
-                inst_nlfile = "{}_{:04d}".format(nlfile, inst_counter)
-                if not os.path.exists(inst_nlfile):
-                    # If there is a user_nl_foo in the case directory, copy it
-                    # to user_nl_foo_INST; otherwise, copy the original
-                    # user_nl_foo from model_dir
-                    if os.path.exists(nlfile):
-                        safe_copy(nlfile, inst_nlfile)
+        default_nlfile = "user_nl_{}".format(comp)
+        model_nl = os.path.join(model_dir, default_nlfile)
+        user_nl_list = _get_user_nl_list(case, default_nlfile, model_dir)
+
+        # Note that, even if there are multiple elements of user_nl_list (i.e., we are
+        # creating multiple user_nl files for this component with different names), all of
+        # them will start out as copies of the single user_nl_comp file in the model's
+        # source tree - unless the file has _stream in its name 
+        for nlfile in user_nl_list:
+            if ninst > 1:
+                for inst_counter in range(1, ninst+1):
+                    inst_nlfile = "{}_{:04d}".format(nlfile, inst_counter)
+                    if not os.path.exists(inst_nlfile):
+                        # If there is a user_nl_foo in the case directory, copy it
+                        # to user_nl_foo_INST; otherwise, copy the original
+                        # user_nl_foo from model_dir
+                        if os.path.exists(nlfile):
+                            safe_copy(nlfile, inst_nlfile)
+                        elif "_stream" in nlfile:
+                            safe_copy(os.path.join(model_dir, nlfile), inst_nlfile)
+                        elif os.path.exists(model_nl):
+                            safe_copy(model_nl, inst_nlfile)
+            else:
+                # ninst = 1
+                if not os.path.exists(nlfile):
+                    if "_stream" in nlfile:
+                        safe_copy(os.path.join(model_dir, nlfile), nlfile)
                     elif os.path.exists(model_nl):
-                        safe_copy(model_nl, inst_nlfile)
-        else:
-            # ninst = 1
-            if not os.path.exists(nlfile):
-                if os.path.exists(model_nl):
-                    safe_copy(model_nl, nlfile)
+                        safe_copy(model_nl, nlfile)
 
 ###############################################################################
-def _case_setup_impl(case, caseroot, clean=False, test_mode=False, reset=False):
+def _get_user_nl_list(case, default_nlfile, model_dir):
+    """Get a list of user_nl files needed by this component
+
+    Typically, each component has a single user_nl file: user_nl_comp. However, some
+    components use multiple user_nl files. These components can define a function in
+    cime_config/buildnml named get_user_nl_list, which returns a list of user_nl files
+    that need to be staged in the case directory. For example, in a run where CISM is
+    modeling both Antarctica and Greenland, its get_user_nl_list function will return
+    ['user_nl_cism', 'user_nl_cism_ais', 'user_nl_cism_gris'].
+
+    If that function is NOT defined in the component's buildnml, then we return the given
+    default_nlfile.
+
+    """
+    # Check if buildnml is present in the expected location, and if so, whether it
+    # contains the function "get_user_nl_list"; if so, we'll import the module and call
+    # that function; if not, we'll fall back on the default value.
+    buildnml_path = os.path.join(model_dir, "buildnml")
+    has_function = False
+    if (os.path.isfile(buildnml_path) and
+        file_contains_python_function(buildnml_path, "get_user_nl_list")):
+        has_function = True
+
+    if has_function:
+        comp_buildnml = import_from_file("comp_buildnml", buildnml_path)
+        return comp_buildnml.get_user_nl_list(case)
+    else:
+        return [default_nlfile]
+
+###############################################################################
+def _create_macros_e3sm(caseroot, srcroot, mach_obj, compiler):
+###############################################################################
+    if not os.path.isfile("Macros.cmake"):
+        safe_copy(os.path.join(srcroot, "cime_config/machines/cmake_macros/Macros.cmake"), caseroot)
+    if not os.path.exists("cmake_macros"):
+        shutil.copytree(os.path.join(srcroot, "cime_config/machines/cmake_macros"), os.path.join(caseroot, "cmake_macros"))
+
+    copy_depends_files(mach_obj.get_machine_name(), mach_obj.machines_dir, caseroot, compiler)
+
+###############################################################################
+def _create_macros(case, mach_obj, caseroot, compiler, mpilib, debug, comp_interface, sysos):
+###############################################################################
+    """
+    creates the Macros.make, Depends.compiler, Depends.machine, Depends.machine.compiler
+    and env_mach_specific.xml if they don't already exist.
+    """
+    reread = not os.path.isfile("env_mach_specific.xml")
+    srcroot = case.get_value("SRCROOT")
+    new_cmake_macro = os.path.join(srcroot, "cime_config/machines/cmake_macros/Macros.cmake")
+    if reread:
+        case.flush()
+        generate_env_mach_specific(
+            caseroot, mach_obj, compiler, mpilib, debug, comp_interface,
+            sysos, False, threaded=case.get_build_threaded(), noenv=True,)
+        case.read_xml()
+
+    # export E3SM_NO_CMAKE_MACRO=1 to disable new macros
+    if get_model() == "e3sm" and os.path.exists(new_cmake_macro) and not "E3SM_NO_CMAKE_MACRO" in os.environ:
+        _create_macros_e3sm(caseroot, srcroot, mach_obj, compiler)
+    else:
+        if not os.path.isfile("Macros.make"):
+            configure(mach_obj,
+                      caseroot, ["Makefile"], compiler, mpilib, debug, comp_interface, sysos, noenv=True,
+                      extra_machines_dir=mach_obj.get_extra_machines_dir())
+
+        # Also write out Cmake macro file
+        if not os.path.isfile("Macros.cmake"):
+            configure(mach_obj,
+                      caseroot, ["CMake"], compiler, mpilib, debug, comp_interface, sysos, noenv=True,
+                      extra_machines_dir=mach_obj.get_extra_machines_dir())
+
+
+###############################################################################
+def _case_setup_impl(case, caseroot, clean=False, test_mode=False, reset=False, keep=None):
 ###############################################################################
     os.chdir(caseroot)
 
-    # Check that $DIN_LOC_ROOT exists - and abort if not a namelist compare tests
-    din_loc_root = case.get_value("DIN_LOC_ROOT")
-    testcase     = case.get_value("TESTCASE")
-    expect(not (not os.path.isdir(din_loc_root) and testcase != "SBN"),
-           "inputdata root is not a directory or is not readable: {}".format(din_loc_root))
+    non_local = case.get_value("NONLOCAL")
+
+    models = case.get_values("COMP_CLASSES")
+    mach = case.get_value("MACH")
+    compiler = case.get_value("COMPILER")
+    debug = case.get_value("DEBUG")
+    mpilib = case.get_value("MPILIB")
+    sysos = case.get_value("OS")
+    comp_interface = case.get_value("COMP_INTERFACE")
+    extra_machines_dir = case.get_value("EXTRA_MACHDIR")
+
+    expect(mach is not None, "xml variable MACH is not set")
+
+    mach_obj = Machines(machine=mach, extra_machines_dir=extra_machines_dir)
+
+    # Check that $DIN_LOC_ROOT exists or can be created:
+    if not non_local:
+        din_loc_root = case.get_value("DIN_LOC_ROOT")
+        testcase     = case.get_value("TESTCASE")
+
+        if not os.path.isdir(din_loc_root):
+            try:
+                os.makedirs(din_loc_root)
+            except OSError as e:
+                if e.errno == errno.EACCES:
+                    logger.info("Invalid permissions to create {}".format(din_loc_root))
+
+        expect(not (not os.path.isdir(din_loc_root) and testcase != "SBN"),
+               "inputdata root is not a directory or is not readable: {}".format(din_loc_root))
 
     # Remove batch scripts
     if reset or clean:
-        # clean batch script
+        # clean setup-generated files
         batch_script = get_batch_script_for_job(case.get_primary_job())
-        if os.path.exists(batch_script):
-            os.remove(batch_script)
-            logger.info("Successfully cleaned batch script {}".format(batch_script))
+        files_to_clean = [batch_script, "env_mach_specific.xml", "Macros.make", "Macros.cmake", "cmake_macros"]
+        for file_to_clean in files_to_clean:
+            if os.path.exists(file_to_clean) and not (keep and file_to_clean in keep):
+                if os.path.isdir(file_to_clean):
+                    shutil.rmtree(file_to_clean)
+                else:
+                    os.remove(file_to_clean)
+                logger.info("Successfully cleaned {}".format(file_to_clean))
 
         if not test_mode:
             # rebuild the models (even on restart)
             case.set_value("BUILD_COMPLETE", False)
 
+        # Cannot leave case in bad state (missing env_mach_specific.xml)
+        if clean and not os.path.isfile("env_mach_specific.xml"):
+            case.flush()
+            generate_env_mach_specific(
+                caseroot, mach_obj, compiler, mpilib, debug, comp_interface,
+                sysos, False, threaded=case.get_build_threaded(), noenv=True,)
+            case.read_xml()
+
     if not clean:
-        case.load_env()
+        if not non_local:
+            case.load_env()
 
-        models = case.get_values("COMP_CLASSES")
-        mach = case.get_value("MACH")
-        compiler = case.get_value("COMPILER")
-        debug = case.get_value("DEBUG")
-        mpilib = case.get_value("MPILIB")
-        sysos = case.get_value("OS")
-        expect(mach is not None, "xml variable MACH is not set")
-
-        # creates the Macros.make, Depends.compiler, Depends.machine, Depends.machine.compiler
-        # and env_mach_specific.xml if they don't already exist.
-        if not os.path.isfile("Macros.make") or not os.path.isfile("env_mach_specific.xml"):
-            configure(Machines(machine=mach), caseroot, ["Makefile"], compiler, mpilib, debug, sysos)
+        _create_macros(case, mach_obj, caseroot, compiler, mpilib, debug, comp_interface, sysos)
 
         # Set tasks to 1 if mpi-serial library
         if mpilib == "mpi-serial":
@@ -107,15 +227,22 @@ def _case_setup_impl(case, caseroot, clean=False, test_mode=False, reset=False):
 
         # Check ninst.
         # In CIME there can be multiple instances of each component model (an ensemble) NINST is the instance of that component.
+        comp_interface = case.get_value("COMP_INTERFACE")
+        if comp_interface == "nuopc":
+            ninst  = case.get_value("NINST")
+
         multi_driver = case.get_value("MULTI_DRIVER")
+
         for comp in models:
             ntasks = case.get_value("NTASKS_{}".format(comp))
             if comp == "CPL":
                 continue
-            ninst  = case.get_value("NINST_{}".format(comp))
+            if comp_interface != "nuopc":
+                ninst  = case.get_value("NINST_{}".format(comp))
             if multi_driver:
-                expect(case.get_value("NINST_LAYOUT_{}".format(comp)) == "concurrent",
-                       "If multi_driver is TRUE, NINST_LAYOUT_{} must be concurrent".format(comp))
+                if comp_interface != "nuopc":
+                    expect(case.get_value("NINST_LAYOUT_{}".format(comp)) == "concurrent",
+                           "If multi_driver is TRUE, NINST_LAYOUT_{} must be concurrent".format(comp))
                 case.set_value("NTASKS_PER_INST_{}".format(comp), ntasks)
             else:
                 if ninst > ntasks:
@@ -151,10 +278,9 @@ def _case_setup_impl(case, caseroot, clean=False, test_mode=False, reset=False):
             case.set_value("SMP_PRESENT", threaded)
             if threaded and case.total_tasks * case.thread_count > cost_per_node:
                 smt_factor = max(1.0,int(case.get_value("MAX_TASKS_PER_NODE") / cost_per_node))
-                case.set_value("TOTALPES", int(case.total_tasks * max(1.0,float(case.thread_count) / smt_factor)))
+                case.set_value("TOTALPES", case.iotasks + int((case.total_tasks - case.iotasks) * max(1.0,float(case.thread_count) / smt_factor)))
             else:
-                case.set_value("TOTALPES", case.total_tasks*case.thread_count)
-
+                case.set_value("TOTALPES", (case.total_tasks - case.iotasks)*case.thread_count + case.iotasks)
 
             # May need to select new batch settings if pelayout changed (e.g. problem is now too big for prev-selected queue)
             env_batch = case.get_env("batch")
@@ -194,31 +320,46 @@ def _case_setup_impl(case, caseroot, clean=False, test_mode=False, reset=False):
         logger.info("If an old case build already exists, might want to run \'case.build --clean\' before building")
 
         # Some tests need namelists created here (ERP) - so do this if we are in test mode
-        if test_mode or get_model() == "e3sm":
+        if (test_mode or get_model() == "e3sm") and not non_local:
             logger.info("Generating component namelists as part of setup")
             case.create_namelists()
 
         # Record env information
         env_module = case.get_env("mach_specific")
+        if mach == "zeus":
+            overrides = env_module.get_overrides_nodes(case)
+            logger.debug("Updating Zeus nodes {}".format(overrides))
         env_module.make_env_mach_specific_file("sh", case)
         env_module.make_env_mach_specific_file("csh", case)
-        env_module.save_all_env_info("software_environment.txt")
+        if not non_local:
+            env_module.save_all_env_info("software_environment.txt")
 
         logger.info("You can now run './preview_run' to get more info on how your case will be run")
 
 ###############################################################################
-def case_setup(self, clean=False, test_mode=False, reset=False):
+def case_setup(self, clean=False, test_mode=False, reset=False, keep=None):
 ###############################################################################
     caseroot, casebaseid = self.get_value("CASEROOT"), self.get_value("CASEBASEID")
     phase = "setup.clean" if clean else "case.setup"
-    functor = lambda: _case_setup_impl(self, caseroot, clean, test_mode, reset)
+    functor = lambda: _case_setup_impl(self, caseroot, clean=clean, test_mode=test_mode, reset=reset, keep=keep)
+
+    is_batch = self.get_value("BATCH_SYSTEM") is not None
+    msg_func = None
+
+    if is_batch:
+        jobid = batch_jobid()
+        msg_func = lambda *args: jobid if jobid is not None else ""
 
     if self.get_value("TEST") and not test_mode:
         test_name = casebaseid if casebaseid is not None else self.get_value("CASE")
         with TestStatus(test_dir=caseroot, test_name=test_name) as ts:
             try:
-                run_and_log_case_status(functor, phase, caseroot=caseroot)
-            except:
+                run_and_log_case_status(functor, phase,
+                                        custom_starting_msg_functor=msg_func,
+                                        custom_success_msg_functor=msg_func,
+                                        caseroot=caseroot,
+                                        is_batch=is_batch)
+            except BaseException: # Want to catch KeyboardInterrupt too
                 ts.set_status(SETUP_PHASE, TEST_FAIL_STATUS)
                 raise
             else:
@@ -227,4 +368,32 @@ def case_setup(self, clean=False, test_mode=False, reset=False):
                 else:
                     ts.set_status(SETUP_PHASE, TEST_PASS_STATUS)
     else:
-        run_and_log_case_status(functor, phase, caseroot=caseroot)
+        run_and_log_case_status(functor, phase,
+                                custom_starting_msg_functor=msg_func,
+                                custom_success_msg_functor=msg_func,
+                                caseroot=caseroot,
+                                is_batch=is_batch)
+
+    # put the following section here to make sure the rundir is generated first
+    machdir = self.get_value("MACHDIR")
+    mach = self.get_value("MACH")
+    ngpus_per_node = self.get_value("NGPUS_PER_NODE")
+    overrides = {}
+    overrides["ngpus_per_node"] = ngpus_per_node
+    input_template = os.path.join(machdir,"mpi_run_gpu.{}".format(mach))
+    if os.path.isfile(input_template):
+        # update the wrapper script that sets the device id for each MPI rank
+        output_text = transform_vars(open(input_template,"r").read(), case=self, overrides=overrides)
+
+        # write it out to the run dir
+        rundir = self.get_value("RUNDIR")
+        output_name = os.path.join(rundir,"set_device_rank.sh")
+        logger.info("Creating file {}".format(output_name))
+        with open(output_name, "w") as f:
+            f.write(output_text)
+
+        # make the wrapper script executable
+        if os.path.isfile(output_name):
+            os.system("chmod +x "+output_name)
+        else:
+            expect(False, "The file {} is not written out correctly.".format(output_name))

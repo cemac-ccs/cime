@@ -3,7 +3,7 @@ Common interface to XML files, this is an abstract class and is expected to
 be used by other XML interface modules and not directly.
 """
 from CIME.XML.standard_module_setup import *
-from CIME.utils import safe_copy
+from CIME.utils import safe_copy, get_src_root
 
 import xml.etree.ElementTree as ET
 #pylint: disable=import-error
@@ -11,6 +11,7 @@ from distutils.spawn import find_executable
 import getpass
 import six
 from copy import deepcopy
+from collections import namedtuple
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,12 @@ class GenericXML(object):
 
     _FILEMAP = {}
     DISABLE_CACHING = False
+    CacheEntry = namedtuple("CacheEntry", ["tree", "root", "modtime"])
+
+    @classmethod
+    def invalidate(cls, filename):
+        if filename in cls._FILEMAP:
+            del cls._FILEMAP[filename]
 
     def __init__(self, infile=None, schema=None, root_name_override=None, root_attrib_override=None, read_only=True):
         """
@@ -52,15 +59,15 @@ class GenericXML(object):
         if infile is None:
             return
 
-        if os.path.isfile(infile) and os.access(infile, os.R_OK):
+        if os.path.isfile(infile) and os.access(infile, os.R_OK) and os.stat(infile).st_size > 0:
             # If file is defined and exists, read it
             self.read(infile, schema)
         else:
             # if file does not exist create a root xml element
             # and set it's id to file
-            expect(not self.read_only, "Makes no sense to have empty read-only file")
-            logger.debug("File {} does not exists.".format(infile))
-            expect("$" not in infile,"File path not fully resolved {}".format(infile))
+            expect(not self.read_only, "Makes no sense to have empty read-only file: {}".format(infile))
+            logger.debug("File {} does not exist.".format(infile))
+            expect("$" not in infile,"File path not fully resolved: {}".format(infile))
 
             root = _Element(ET.Element("xml"))
 
@@ -71,17 +78,25 @@ class GenericXML(object):
 
             self.tree = ET.ElementTree(root)
 
+            self._FILEMAP[infile] = self.CacheEntry(self.tree, self.root, 0.0)
+
     def read(self, infile, schema=None):
         """
         Read and parse an xml file into the object
         """
-        if not self.DISABLE_CACHING and infile in self._FILEMAP and self.read_only:
-            logger.debug("read (cached): " + infile)
-            expect(self.read_only or not self.filename or not self.needsrewrite, "Reading into object marked for rewrite, file {}"
-                   .format(self.filename))
-            self.tree, self.root = self._FILEMAP[infile]
-        else:
-            logger.debug("read: " + infile)
+        cached_read = False
+        if not self.DISABLE_CACHING and infile in self._FILEMAP:
+            timestamp_cache = self._FILEMAP[infile].modtime
+            timestamp_file  = os.path.getmtime(infile)
+            if timestamp_file == timestamp_cache:
+                logger.debug("read (cached): {}".format(infile))
+                expect(self.read_only or not self.filename or not self.needsrewrite,
+                       "Reading into object marked for rewrite, file {}".format(self.filename))
+                self.tree, self.root, _ = self._FILEMAP[infile]
+                cached_read = True
+
+        if not cached_read:
+            logger.debug("read: {}".format(infile))
             file_open = (lambda x: open(x, 'r', encoding='utf-8')) if six.PY3 else (lambda x: open(x, 'r'))
             with file_open(infile) as fd:
                 self.read_fd(fd)
@@ -91,26 +106,38 @@ class GenericXML(object):
 
             logger.debug("File version is {}".format(str(self.get_version())))
 
-            self._FILEMAP[infile] = (self.tree, self.root)
+            self._FILEMAP[infile] = self.CacheEntry(self.tree, self.root, os.path.getmtime(infile))
 
     def read_fd(self, fd):
-        expect(self.read_only or not self.filename or not self.needsrewrite, "Reading into object marked for rewrite, file {}"               .format(self.filename))
+        expect(self.read_only or not self.filename or not self.needsrewrite,
+               "Reading into object marked for rewrite, file {}".format(self.filename))
+        read_only = self.read_only
         if self.tree:
             addroot = _Element(ET.parse(fd).getroot())
-            read_only = self.read_only
             # we need to override the read_only mechanism here to append the xml object
-            if read_only:
-                self.read_only = False
+            self.read_only = False
             if addroot.xml_element.tag == self.name(self.root):
                 for child in self.get_children(root=addroot):
                     self.add_child(child)
             else:
                 self.add_child(addroot)
-            if read_only:
-                self.read_only = True
+            self.read_only = read_only
         else:
             self.tree = ET.parse(fd)
             self.root = _Element(self.tree.getroot())
+        include_elems = self.scan_children("xi:include")
+        # First remove all includes found from the list
+        for elem in include_elems:
+            self.read_only = False
+            self.remove_child(elem)
+            self.read_only = read_only
+        # Then recursively add the included files.
+        for elem in include_elems:
+            path = os.path.abspath(
+                os.path.join(os.getcwd(), os.path.dirname(self.filename),
+                             self.get(elem, "href")))
+            logger.debug("Include file {}".format(path))
+            self.read(path)
 
     def lock(self):
         """
@@ -144,17 +171,17 @@ class GenericXML(object):
         return attrib_name in node.xml_element.attrib
 
     def set(self, node, attrib_name, value):
-        expect(not self.read_only, "locked")
-        if attrib_name == "id":
-            expect(not self.locked, "locked")
         if self.get(node, attrib_name) != value:
+            expect(not self.read_only, "read_only: cannot set attrib[{}]={} for node {} in file {}".format(attrib_name, value, self.name(node), self.filename))
+            if attrib_name == "id":
+                expect(not self.locked, "locked: cannot set attrib[{}]={} for node {} in file {}".format(attrib_name, value, self.name(node), self.filename))
             self.needsrewrite = True
             return node.xml_element.set(attrib_name, value)
 
     def pop(self, node, attrib_name):
-        expect(not self.read_only, "locked")
+        expect(not self.read_only, "read_only: cannot pop attrib[{}] for node {} in file {}".format(attrib_name, self.name(node), self.filename))
         if attrib_name == "id":
-            expect(not self.locked, "locked")
+            expect(not self.locked, "locked: cannot pop attrib[{}] for node {} in file {}".format(attrib_name, self.name(node), self.filename))
         self.needsrewrite = True
         return node.xml_element.attrib.pop(attrib_name)
 
@@ -163,13 +190,13 @@ class GenericXML(object):
         return None if node.xml_element.attrib is None else dict(node.xml_element.attrib)
 
     def set_name(self, node, name):
-        expect(not self.read_only, "locked")
+        expect(not self.read_only, "read_only: set node name {} in file {}".format(name, self.filename))
         if node.xml_element.tag != name:
             self.needsrewrite = True
             node.xml_element.tag = name
 
     def set_text(self, node, text):
-        expect(not self.read_only, "locked")
+        expect(not self.read_only, "read_only: set node text {} for node {} in file {}".format(text, self.name(node), self.filename))
         if node.xml_element.text != text:
             node.xml_element.text = text
             self.needsrewrite = True
@@ -184,7 +211,7 @@ class GenericXML(object):
         """
         Add element node to self at root
         """
-        expect(not self.locked and not self.read_only, "locked")
+        expect(not self.locked and not self.read_only, "{}: cannot add child {} in file {}".format("read_only" if self.read_only else "locked", self.name(node), self.filename))
         self.needsrewrite = True
         root = root if root is not None else self.root
         if position is not None:
@@ -196,13 +223,13 @@ class GenericXML(object):
         return deepcopy(node)
 
     def remove_child(self, node, root=None):
-        expect(not self.locked and not self.read_only, "locked")
+        expect(not self.locked and not self.read_only, "{}: cannot remove child {} in file {}".format("read_only" if self.read_only else "locked", self.name(node), self.filename))
         self.needsrewrite = True
         root = root if root is not None else self.root
         root.xml_element.remove(node.xml_element)
 
     def make_child(self, name, attributes=None, root=None, text=None):
-        expect(not self.locked and not self.read_only, "locked")
+        expect(not self.locked and not self.read_only, "{}: cannot make child {} in file {}".format("read_only" if self.read_only else "locked", name, self.filename))
         root = root if root is not None else self.root
         self.needsrewrite = True
         if attributes is None:
@@ -215,11 +242,20 @@ class GenericXML(object):
 
         return node
 
+    def make_child_comment(self, root=None, text=None):
+        expect(not self.locked and not self.read_only, "{}: cannot make child {} in file {}".format("read_only" if self.read_only else "locked", text, self.filename))
+        root = root if root is not None else self.root
+        self.needsrewrite = True
+        et_comment = ET.Comment(text)
+        node = _Element(et_comment)
+        root.xml_element.append(node.xml_element)
+        return node
+
     def get_children(self, name=None, attributes=None, root=None):
         """
         This is the critical function, its interface and performance are crucial.
 
-        You can specify attributes={key:None} if you want to select chilren
+        You can specify attributes={key:None} if you want to select children
         with the key attribute but you don't care what its value is.
         """
         root = root if root is not None else self.root
@@ -251,13 +287,21 @@ class GenericXML(object):
         return children
 
     def get_child(self, name=None, attributes=None, root=None, err_msg=None):
-        children = self.get_children(root=root, name=name, attributes=attributes)
-        expect(len(children) == 1, err_msg if err_msg else "Expected one child")
-        return children[0]
+        child = self.get_optional_child(root=root, name=name, attributes=attributes, err_msg=err_msg)
+        expect(child, err_msg if err_msg else "Expected one child, found None with name '{}' and attribs '{}' in file {}".format(name, attributes, self.filename))
+        return child
 
     def get_optional_child(self, name=None, attributes=None, root=None, err_msg=None):
         children = self.get_children(root=root, name=name, attributes=attributes)
-        expect(len(children) <= 1, err_msg if err_msg else "Multiple matches")
+        if len(children) > 1:
+            # see if we can reduce to 1 based on attribute counts
+            if not attributes:
+                children = [c for c in children if not c.xml_element.attrib]
+            else:
+                attlen = len(attributes)
+                children = [c for c in children if len(c.xml_element.attrib) == attlen]
+
+        expect(len(children) <= 1, err_msg if err_msg else "Multiple matches for name '{}' and attribs '{}' in file {}".format(name, attributes, self.filename))
         return children[0] if children else None
 
     def get_element_text(self, element_name, attributes=None, root=None):
@@ -285,12 +329,30 @@ class GenericXML(object):
         version = 1.0 if version is None else float(version)
         return version
 
+    def check_timestamp(self):
+        """
+        Returns True if timestamp matches what is expected
+        """
+        timestamp_cache = self._FILEMAP[self.filename].modtime
+        if timestamp_cache != 0.0:
+            timestamp_file  = os.path.getmtime(self.filename)
+            return timestamp_file == timestamp_cache
+        else:
+            return True
+
+    def validate_timestamp(self):
+        timestamp_ok = self.check_timestamp()
+        expect(timestamp_ok,
+               "File {} appears to have changed without a corresponding invalidation.".format(self.filename))
+
     def write(self, outfile=None, force_write=False):
         """
         Write an xml file from data in self
         """
         if not (self.needsrewrite or force_write):
             return
+
+        self.validate_timestamp()
 
         if outfile is None:
             outfile = self.filename
@@ -301,6 +363,7 @@ class GenericXML(object):
 
         # xmllint provides a better format option for the output file
         xmllint = find_executable("xmllint")
+
         if xmllint is not None:
             if isinstance(outfile, six.string_types):
                 run_cmd_no_fail("{} --format --output {} -".format(xmllint, outfile), input_str=xmlstr)
@@ -310,6 +373,9 @@ class GenericXML(object):
         else:
             with open(outfile,'w') as xmlout:
                 xmlout.write(xmlstr)
+
+        self._FILEMAP[self.filename] = self.CacheEntry(self.tree, self.root, os.path.getmtime(self.filename))
+
         self.needsrewrite = False
 
     def scan_child(self, nodename, attributes=None, root=None):
@@ -343,6 +409,8 @@ class GenericXML(object):
             root = self.root
         nodes = []
 
+        namespace = {"xi" : "http://www.w3.org/2001/XInclude"}
+
         xpath = ".//" + (nodename if nodename else "")
 
         if attributes:
@@ -359,7 +427,7 @@ class GenericXML(object):
                 logger.debug("xpath is {}".format(xpath))
 
                 try:
-                    newnodes = root.xml_element.findall(xpath)
+                    newnodes = root.xml_element.findall(xpath, namespace)
                 except Exception as e:
                     expect(False, "Bad xpath search term '{}', error: {}".format(xpath, e))
 
@@ -374,7 +442,7 @@ class GenericXML(object):
 
         else:
             logger.debug("xpath: {}".format(xpath))
-            nodes = root.xml_element.findall(xpath)
+            nodes = root.xml_element.findall(xpath, namespace)
 
         logger.debug("Returning {} nodes ({})".format(len(nodes), nodes))
 
@@ -399,6 +467,8 @@ class GenericXML(object):
         valnodes = self.get_children(vid)
         for node in valnodes:
             self.set_text(node, value)
+
+        return value if valnodes else None
 
     def get_resolved_value(self, raw_value, allow_unresolved_envvars=False):
         """
@@ -448,8 +518,10 @@ class GenericXML(object):
         for m in reference_re.finditer(item_data):
             var = m.groups()[0]
             logger.debug("find: {}".format(var))
-            #pylint: disable=assignment-from-none
-            ref = self.get_value(var)
+            # The overridden versions of this method do not simply return None
+            # so the pylint should not be flagging this
+            ref = self.get_value(var) # pylint: disable=assignment-from-none
+
             if ref is not None:
                 logger.debug("resolve: " + str(ref))
                 item_data = item_data.replace(m.group(), self.get_resolved_value(str(ref)))
@@ -457,7 +529,7 @@ class GenericXML(object):
                 cimeroot = get_cime_root()
                 item_data = item_data.replace(m.group(), cimeroot)
             elif var == "SRCROOT":
-                srcroot = os.path.join(get_cime_root(),"..")
+                srcroot = get_src_root()
                 item_data = item_data.replace(m.group(), srcroot)
             elif var == "USER":
                 item_data = item_data.replace(m.group(), getpass.getuser())
@@ -465,7 +537,7 @@ class GenericXML(object):
         if math_re.search(item_data):
             try:
                 tmp = eval(item_data)
-            except:
+            except Exception:
                 tmp = item_data
             item_data = str(tmp)
 
@@ -478,11 +550,10 @@ class GenericXML(object):
         expect(os.path.isfile(filename),"xml file not found {}".format(filename))
         expect(os.path.isfile(schema),"schema file not found {}".format(schema))
         xmllint = find_executable("xmllint")
-        if xmllint is not None:
-            logger.debug("Checking file {} against schema {}".format(filename, schema))
-            run_cmd_no_fail("{} --noout --schema {} {}".format(xmllint, schema, filename))
-        else:
-            logger.warning("xmllint not found, could not validate file {}".format(filename))
+        expect(os.path.isfile(xmllint), " xmllint not found in PATH, xmllint is required for cime.  PATH={}".format(os.environ["PATH"]))
+
+        logger.debug("Checking file {} against schema {}".format(filename, schema))
+        run_cmd_no_fail("{} --xinclude --noout --schema {} {}".format(xmllint, schema, filename))
 
     def get_raw_record(self, root=None):
         logger.debug("writing file {}".format(self.filename))

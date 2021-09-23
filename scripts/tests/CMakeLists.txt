@@ -2,14 +2,14 @@
 # Environment variables CIME_COMPILER and CIME_MPILIB
 # can be used to send --compiler and --mpilib settings to scripts_regression_tests.py
 #
-
+PROJECT(cime)
 cmake_minimum_required(VERSION 2.8)
 
 include(CTest)
 if (DEFINED ENV{PYTHON})
   set(PYTHON $ENV{PYTHON})
 else()
-  set(PYTHON "python")
+  set(PYTHON "python3")
 endif()
 
 execute_process(COMMAND ${PYTHON} "--version" OUTPUT_VARIABLE PY_VER

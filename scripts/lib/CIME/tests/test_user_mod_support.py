@@ -1,11 +1,13 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 import shutil
 import tempfile
 import os
 from CIME.user_mod_support import apply_user_mods
+from CIME.utils import CIMEError
 import six
+
 # ========================================================================
 # Define some parameters
 # ========================================================================
@@ -114,7 +116,7 @@ class TestUserModSupport(unittest.TestCase):
 
     def test_keepexe(self):
         self.createUserMod("foo")
-        with six.assertRaisesRegex(self, SystemExit, "cannot have any source mods"):
+        with six.assertRaisesRegex(self, CIMEError, "cannot have any source mods"):
             apply_user_mods(self._caseroot,
                             os.path.join(self._user_mods_parent_dir, "foo"), keepexe=True)
 
@@ -174,3 +176,6 @@ derived_combo
                            expected_shell_commands_result = expected_contents,
                            expected_sourcemod = "derived_combo\n",
                            msg = "test_duplicate_includes")
+
+if __name__ == '__main__':
+    unittest.main()

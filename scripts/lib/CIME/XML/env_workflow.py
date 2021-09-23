@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class EnvWorkflow(EnvBase):
 
-    def __init__(self, case_root=None, infile="env_workflow.xml"):
+    def __init__(self, case_root=None, infile="env_workflow.xml", read_only=False):
         """
         initialize an object interface to file env_workflow.xml in the case directory
         """
@@ -21,14 +21,14 @@ class EnvWorkflow(EnvBase):
         #        schema = os.path.join(get_cime_root(), "config", "xml_schemas", "env_workflow.xsd")
         # TODO: define schema for this file
         schema = None
-        super(EnvWorkflow,self).__init__(case_root, infile, schema=schema)
+        super(EnvWorkflow,self).__init__(case_root, infile, schema=schema, read_only=read_only)
 
     def create_job_groups(self, batch_jobs, is_test):
         # Subtle: in order to support dynamic batch jobs, we need to remove the
         # job_submission group and replace with job-based groups
-
-        orig_group = self.get_child("group", {"id":"job_submission"},
+        orig_group = self.get_optional_child("group", {"id":"job_submission"},
                                     err_msg="Looks like job groups have already been created")
+        expect(orig_group, "No workflow groups found")
         orig_group_children = super(EnvWorkflow, self).get_children(root=orig_group)
 
         childnodes = []
@@ -65,6 +65,7 @@ class EnvWorkflow(EnvBase):
 
     def get_type_info(self, vid):
         gnodes = self.get_children("group")
+        type_info = None
         for gnode in gnodes:
             nodes = self.get_children("entry",{"id":vid}, root=gnode)
             type_info = None
@@ -77,19 +78,26 @@ class EnvWorkflow(EnvBase):
                             "Inconsistent type_info for entry id={} {} {}".format(vid, new_type_info, type_info))
         return type_info
 
-    def get_job_specs(self, job):
-        task_count = self.get_value("task_count", subgroup=job)
-        tasks_per_node = self.get_value("tasks_per_node", subgroup=job)
-        thread_count = self.get_value("thread_count", subgroup=job)
+    def get_job_specs(self, case, job):
+        task_count = case.get_resolved_value(self.get_value("task_count", subgroup=job))
+        tasks_per_node = case.get_resolved_value(self.get_value("tasks_per_node", subgroup=job))
+        thread_count = case.get_resolved_value(self.get_value("thread_count", subgroup=job))
+        max_gpus_per_node = case.get_value("MAX_GPUS_PER_NODE")
+        ngpus_per_node = case.get_value("NGPUS_PER_NODE")
         num_nodes = None
-        if task_count is not None:
+        if not ngpus_per_node:
+            max_gpus_per_node = 0
+            ngpus_per_node = 0
+        if task_count is not None and tasks_per_node is not None:
             task_count = int(task_count)
             num_nodes   = int(math.ceil(float(task_count)/float(tasks_per_node)))
             tasks_per_node =  task_count//num_nodes
         if not thread_count:
             thread_count = 1
+        if ngpus_per_node > max_gpus_per_node:
+            ngpus_per_node = max_gpus_per_node
 
-        return task_count, num_nodes, tasks_per_node, thread_count
+        return task_count, num_nodes, tasks_per_node, thread_count, ngpus_per_node
 
     # pylint: disable=arguments-differ
     def get_value(self, item, attribute=None, resolved=True, subgroup="PRIMARY"):

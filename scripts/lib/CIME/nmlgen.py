@@ -17,6 +17,7 @@ from CIME.namelist import Namelist, parse, \
 from CIME.XML.namelist_definition import NamelistDefinition
 from CIME.utils import expect, safe_copy
 from CIME.XML.stream import Stream
+from CIME.XML.grids import GRID_SEP
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ _var_ref_re = re.compile(r"\$(\{)?(?P<name>\w+)(?(1)\})")
 
 _ymd_re = re.compile(r"%(?P<digits>[1-9][0-9]*)?y(?P<month>m(?P<day>d)?)?")
 
-_stream_file_template = """<?xml version="1.0"?>
+_stream_mct_file_template = """<?xml version="1.0"?>
 <file id="stream" version="1.0">
 <dataSource>
    GENERIC
@@ -90,6 +91,10 @@ class NamelistGenerator(object):
         # Create namelist object.
         self._namelist = Namelist()
 
+        # entries for which we should potentially call add_default (variables that do not
+        # set skip_default_entry)
+        self._default_nodes = []
+
     # Define __enter__ and __exit__ so that we can use this as a context manager
     def __enter__(self):
         return self
@@ -97,16 +102,28 @@ class NamelistGenerator(object):
     def __exit__(self, *_):
         return False
 
-    def init_defaults(self, infiles, config, skip_groups=None, skip_entry_loop=None ):
+    def init_defaults(self, infiles, config, skip_groups=None, skip_entry_loop=False,
+                      skip_default_for_groups=None):
         """Return array of names of all definition nodes
+
+        infiles should be a list of file paths, each one giving namelist settings that
+        take precedence over the default values. Often there will be only one file in this
+        list. If there are multiple files, earlier files take precedence over later files.
+
+        If skip_default_for_groups is provided, it should be a list of namelist group
+        names; the add_default call will not be done for any variables in these
+        groups. This is often paired with later conditional calls to
+        add_defaults_for_group.
+
         """
+        if skip_default_for_groups is None:
+            skip_default_for_groups = []
+
         # first clean out any settings left over from previous calls
         self.new_instance()
 
-        self._definition.set_nodes(skip_groups=skip_groups)
-
         # Determine the array of entry nodes that will be acted upon
-        entry_nodes = self._definition.set_nodes(skip_groups=skip_groups)
+        self._default_nodes = self._definition.set_nodes(skip_groups=skip_groups)
 
         # Add attributes to definition object
         self._definition.add_attributes(config)
@@ -128,10 +145,47 @@ class NamelistGenerator(object):
             self._namelist.merge_nl(new_namelist)
 
         if not skip_entry_loop:
-            for entry in entry_nodes:
+            for entry in self._default_nodes:
+                group_name = self._definition.get_group_name(entry)
+                if not group_name in skip_default_for_groups:
+                    self.add_default(self._definition.get(entry, "id"))
+
+        return [self._definition.get(entry, "id") for entry in self._default_nodes]
+
+    def add_defaults_for_group(self, group):
+        """Call add_default for namelist variables in the given group
+
+        This still skips variables that have attributes of skip_default_entry or
+        per_stream_entry.
+
+        This must be called after init_defaults. It is often paired with use of
+        skip_default_for_groups in the init_defaults call.
+        """
+        for entry in self._default_nodes:
+            group_name = self._definition.get_group_name(entry)
+            if group_name == group:
                 self.add_default(self._definition.get(entry, "id"))
-        else:
-            return [self._definition.get(entry, "id") for entry in entry_nodes]
+
+    def confirm_group_is_empty(self, group_name, errmsg):
+        """Confirms that no values have been added to the given group
+
+        If any values HAVE been added to this group, aborts with the given error message.
+
+        This is often paired with use of skip_default_for_groups in the init_defaults call
+        and add_defaults_for_group, as in:
+
+            if nmlgen.get_value("enable_frac_overrides") == ".true.":
+                nmlgen.add_defaults_for_group("glc_override_nml")
+            else:
+                nmlgen.confirm_empty("glc_override_nml", "some message")
+
+        Args:
+        group_name: string - name of namelist group
+        errmsg: string - error message to print if group is not empty
+        """
+        variables_in_group = self._namelist.get_variable_names(group_name)
+        fullmsg = "{}\nOffending variables: {}".format(errmsg, variables_in_group)
+        expect(len(variables_in_group) == 0, fullmsg)
 
     @staticmethod
     def quote_string(string):
@@ -147,38 +201,40 @@ class NamelistGenerator(object):
     def _to_python_value(self, name, literals):
         """Transform a literal list as needed for `get_value`."""
         var_type, _, var_size, = self._definition.split_type_string(name)
-        if len(literals) > 0:
-            value = expand_literal_list(literals)
+        if len(literals) > 0 and literals[0] is not None:
+            values = expand_literal_list(literals)
         else:
-            value = ''
-            return value
-        for i, scalar in enumerate(value):
-            if scalar == '':
-                value[i] = None
-            elif var_type == 'character':
-                value[i] = character_literal_to_string(scalar)
-        if var_size == 1:
-            return value[0]
-        else:
-            return value
+            return ""
 
-    def _to_namelist_literals(self, name, value):
+        for i, scalar in enumerate(values):
+            if scalar == '':
+                values[i] = None
+            elif var_type == 'character':
+                values[i] = character_literal_to_string(scalar)
+
+        if var_size == 1:
+            return values[0]
+        else:
+            return values
+
+    def _to_namelist_literals(self, name, values):
         """Transform a literal list as needed for `set_value`.
 
         This is the inverse of `_to_python_value`, except that many of the
         changes have potentially already been performed.
         """
         var_type, _, var_size, =  self._definition.split_type_string(name)
-        if var_size == 1 and not isinstance(value, list):
-            value = [value]
-        for i, scalar in enumerate(value):
+        if var_size == 1 and not isinstance(values, list):
+            values = [values]
+
+        for i, scalar in enumerate(values):
             if scalar is None:
-                value[i] = ""
+                values[i] = ""
             elif var_type == 'character':
                 expect(not isinstance(scalar, list), name)
-                value[i] = self.quote_string(scalar)
-        return compress_literal_list(value)
+                values[i] = self.quote_string(scalar)
 
+        return compress_literal_list(values)
 
     def get_value(self, name):
         """Get the current value of a given namelist variable.
@@ -220,7 +276,8 @@ class NamelistGenerator(object):
         var_group = self._definition.get_group(name)
         literals = self._to_namelist_literals(name, value)
         _, _, var_size, = self._definition.split_type_string(name)
-        self._namelist.set_variable_value(var_group, name, literals, var_size)
+        if len(literals) > 0 and literals[0] is not None:
+            self._namelist.set_variable_value(var_group, name, literals, var_size)
 
     def get_default(self, name, config=None, allow_none=False):
         """Get the value of a variable from the namelist definition file.
@@ -267,10 +324,14 @@ class NamelistGenerator(object):
             match = _var_ref_re.search(scalar)
             while match:
                 env_val = self._case.get_value(match.group('name'))
-                expect(env_val is not None,
-                       "Namelist default for variable {} refers to unknown XML variable {}.".format(name, match.group('name')))
-                scalar = scalar.replace(match.group(0), str(env_val), 1)
-                match = _var_ref_re.search(scalar)
+                if env_val is not None:
+                    scalar = scalar.replace(match.group(0), str(env_val), 1)
+                    match = _var_ref_re.search(scalar)
+                else:
+                    scalar = None
+                    logger.warning("Namelist default for variable {} refers to unknown XML variable {}.".
+                       format(name, match.group('name')))
+                    match = None
             default[i] = scalar
 
         # Deal with missing quotes.
@@ -298,7 +359,6 @@ class NamelistGenerator(object):
         """ Clean the object just enough to introduce a new instance """
         self.clean_streams()
         self._namelist.clean_groups()
-
 
     def _sub_fields(self, varnames):
         """Substitute indicators with given values in a list of fields.
@@ -415,6 +475,16 @@ class NamelistGenerator(object):
                     new_lines.append(new_line)
         return "\n".join(new_lines)
 
+    @staticmethod
+    def _add_xml_delimiter(list_to_deliminate, delimiter):
+        expect(delimiter and not " " in delimiter, "Missing or badly formed delimiter")
+        pred = "<{}>".format(delimiter)
+        postd = "</{}>".format(delimiter)
+        for n,_ in enumerate(list_to_deliminate):
+            list_to_deliminate[n] = pred + list_to_deliminate[n].strip() + postd
+        return "\n      ".join(list_to_deliminate)
+
+
     def create_stream_file_and_update_shr_strdata_nml(self, config, caseroot, #pylint:disable=too-many-locals
                            stream, stream_path, data_list_path):
         """Write the pseudo-XML file corresponding to a given stream.
@@ -473,7 +543,7 @@ class NamelistGenerator(object):
                 domain_filepath = data_filepath
                 domain_filenames = data_filenames.splitlines()[0]
 
-            stream_file_text = _stream_file_template.format(
+            stream_file_text = _stream_mct_file_template.format(
                 domain_varnames=domain_varnames,
                 domain_filepath=domain_filepath,
                 domain_filenames=domain_filenames,
@@ -563,6 +633,8 @@ class NamelistGenerator(object):
         have_value = False
         # Check for existing value.
         current_literals = self._namelist.get_variable_value(group, name)
+        if current_literals != [""]:
+            have_value = True
 
         # Check for input argument.
         if value is not None:
@@ -577,7 +649,8 @@ class NamelistGenerator(object):
             have_value = True
             default_literals = self._to_namelist_literals(name, default)
             current_literals = merge_literal_lists(default_literals, current_literals)
-        expect(have_value, "No default value found for {}.".format(name))
+        expect(have_value, "No default value found for {} with attributes {}.".format(
+            name, self._definition.get_attributes()))
 
         # Go through file names and prepend input data root directory for
         # absolute pathnames.
@@ -590,19 +663,40 @@ class NamelistGenerator(object):
                     if literal == '':
                         continue
                     file_path = character_literal_to_string(literal)
-                    # NOTE - these are hard-coded here and a better way is to make these extensible
-                    if file_path == 'UNSET' or file_path == 'idmap' or file_path == 'idmap_ignore':
-                        continue
-                    if file_path == 'null':
-                        continue
-                    file_path = self.set_abs_file_path(file_path)
-                    if not os.path.exists(file_path):
-                        logger.warning("File not found: {} = {}, will attempt to download in check_input_data phase".format(name, literal))
-                    current_literals[i] = string_to_character_literal(file_path)
+                    abs_file_path = self._convert_to_abs_file_path(file_path, name)
+                    current_literals[i] = string_to_character_literal(abs_file_path)
                 current_literals = compress_literal_list(current_literals)
 
         # Set the new value.
         self._namelist.set_variable_value(group, name, current_literals, var_size)
+
+    def _convert_to_abs_file_path(self, file_path, name):
+        """Convert the given file_path to an abs file path and return the result
+
+        It's possible that file_path actually contains multiple files delimited by
+        GRID_SEP. (This is the case when a component has multiple grids, and so has a file
+        for each grid.) In this case, we split it on GRID_SEP and handle each separated
+        portion as a separate file, then return a new GRID_SEP-delimited string.
+
+        """
+        abs_file_paths = []
+        # In most cases, the list created by the following split will only contain a
+        # single element, but this split is needed to handle grid-related files for
+        # components with multiple grids (e.g., GLC).
+        for one_file_path in file_path.split(GRID_SEP):
+            # NOTE - these are hard-coded here and a better way is to make these extensible
+            if one_file_path == 'UNSET' or one_file_path == 'idmap' or one_file_path == 'idmap_ignore' or one_file_path == 'unset':
+                abs_file_paths.append(one_file_path)
+            elif one_file_path in ('null','create_mesh'):
+                abs_file_paths.append(one_file_path)
+            else:
+                one_abs_file_path = self.set_abs_file_path(one_file_path)
+                if not os.path.exists(one_abs_file_path):
+                    logger.warning("File not found: {} = {}, will attempt to download in check_input_data phase".format(
+                        name, one_abs_file_path))
+                abs_file_paths.append(one_abs_file_path)
+
+        return GRID_SEP.join(abs_file_paths)
 
     def create_shr_strdata_nml(self):
         """Set defaults for `shr_strdata_nml` variables other than the variable domainfile """
@@ -641,33 +735,61 @@ class NamelistGenerator(object):
                         literals = self._namelist.get_variable_value(group_name, variable_name)
                         for literal in literals:
                             file_path = character_literal_to_string(literal)
-                            # NOTE - these are hard-coded here and a better way is to make these extensible
-                            if file_path == 'UNSET' or file_path == 'idmap' or file_path == 'idmap_ignore':
-                                continue
-                            if input_pathname == 'abs':
-                                # No further mangling needed for absolute paths.
-                                # At this point, there are overwrites that should be ignored
-                                if not os.path.isabs(file_path):
-                                    continue
-                                else:
-                                    pass
-                            elif input_pathname.startswith('rel:'):
-                                # The part past "rel" is the name of a variable that
-                                # this variable specifies its path relative to.
-                                root_var = input_pathname[4:]
-                                root_dir = self.get_value(root_var)
-                                file_path = os.path.join(root_dir, file_path)
-                            else:
-                                expect(False,
-                                       "Bad input_pathname value: {}.".format(input_pathname))
-                            # Write to the input data list.
-                            string = "{} = {}".format(variable_name, file_path)
-                            hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
-                            if hashValue not in lines_hash:
-                                logger.debug("Adding line {} with hash {}".format(string,hashValue))
-                                input_data_list.write(string+"\n")
-                            else:
-                                logger.debug("Line already in file {}".format(string))
+                            self._add_file_to_input_data_list(input_data_list=input_data_list,
+                                                              variable_name=variable_name,
+                                                              file_path=file_path,
+                                                              input_pathname=input_pathname,
+                                                              lines_hash=lines_hash)
+
+    def _add_file_to_input_data_list(self, input_data_list, variable_name, file_path, input_pathname, lines_hash):
+        """Add one file to the input data list, if needed
+
+        It's possible that file_path actually contains multiple files delimited by
+        GRID_SEP. (This is the case when a component has multiple grids, and so has a file
+        for each grid.) In this case, we split it on GRID_SEP and handle each separated
+        portion as a separate file.
+
+        Args:
+        - input_data_list: file handle
+        - variable_name (string): name of variable to add
+        - file_path (string): path to file
+        - input_pathname (string): whether this is an absolute or relative path
+        - lines_hash (set): set of hashes of lines already in the given input data list
+
+        """
+        for one_file_path in file_path.split(GRID_SEP):
+            # NOTE - these are hard-coded here and a better way is to make these extensible
+            if one_file_path == 'UNSET' or one_file_path == 'idmap' or one_file_path == 'idmap_ignore':
+                continue
+            if input_pathname == 'abs':
+                # No further mangling needed for absolute paths.
+                # At this point, there are overwrites that should be ignored
+                if not os.path.isabs(one_file_path):
+                    continue
+                else:
+                    pass
+            elif input_pathname.startswith('rel:'):
+                # The part past "rel" is the name of a variable that
+                # this variable specifies its path relative to.
+                root_var = input_pathname[4:]
+                root_dir = self.get_value(root_var)
+                one_file_path = os.path.join(root_dir, one_file_path)
+            else:
+                expect(False,
+                       "Bad input_pathname value: {}.".format(input_pathname))
+
+            # Write to the input data list.
+            #
+            # Note that the same variable name is repeated for each file. This currently
+            # seems okay for check_input_data, but if it becomes a problem, we could
+            # change this, e.g., appending an index to the end of variable_name.
+            string = "{} = {}".format(variable_name, one_file_path)
+            hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
+            if hashValue not in lines_hash:
+                logger.debug("Adding line {} with hash {}".format(string,hashValue))
+                input_data_list.write(string+"\n")
+            else:
+                logger.debug("Line already in file {}".format(string))
 
     def write_output_file(self, namelist_file, data_list_path=None, groups=None, sorted_groups=True):
         """Write out the namelists and input data files.
@@ -693,14 +815,31 @@ class NamelistGenerator(object):
         if data_list_path is not None:
             self._write_input_files(data_list_path)
 
+
+    # For MCT
     def add_nmlcontents(self, filename, group, append=True, format_="nmlcontents", sorted_groups=True):
         """ Write only contents of nml group """
         self._namelist.write(filename, groups=[group], append=append, format_=format_, sorted_groups=sorted_groups)
 
     def write_seq_maps(self, filename):
-        """ Write out seq_maps.rc"""
+        """ Write mct out seq_maps.rc"""
         self._namelist.write(filename, groups=["seq_maps"], format_="rc")
 
     def write_modelio_file(self, filename):
-        """ Write  component modelio files"""
+        """ Write mct component modelio files"""
         self._namelist.write(filename, groups=["modelio", "pio_inparm"], format_="nml")
+
+    # For NUOPC
+    def write_nuopc_modelio_file(self, filename):
+        """ Write nuopc component modelio files"""
+        self._namelist.write(filename, groups=["pio_inparm"], format_="nml")
+
+    def write_nuopc_config_file(self, filename, data_list_path=None, sorted_groups=False):
+        """ Write the nuopc config file"""
+        self._definition.validate(self._namelist)
+        groups = self._namelist.get_group_names()
+        # write the config file
+        self._namelist.write_nuopc(filename, groups=groups, sorted_groups=sorted_groups)
+        # append to input_data_list file
+        if data_list_path is not None:
+            self._write_input_files(data_list_path)

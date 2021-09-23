@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 Allows changing variables in env_*xml files via a command-line interface.
@@ -48,7 +48,7 @@ Examples:
 
 from standard_script_setup import *
 
-from CIME.utils import expect, convert_to_type, append_case_status
+from CIME.utils import expect, convert_to_type, append_case_status, get_batch_script_for_job
 from CIME.case import Case
 
 import re
@@ -129,9 +129,12 @@ def parse_command_line(args, description):
 
     return args.caseroot, listofsettings, args.file, args.id, args.val, args.subgroup, args.append, args.noecho, args.force , args.dryrun
 
-def xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun):
+def xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun, env_test):
     if xmlid in ["THREAD_COUNT", "TOTAL_TASKS", "TASKS_PER_NODE", "NUM_NODES", "SPARE_NODES", "TASKS_PER_NUMA", "CORES_PER_TASK"]:
         expect(False, "Cannot xmlchange derived attribute {}".format(xmlid))
+
+    if env_test and env_test.get_value(xmlid) != None:
+        logger.warning("The variable {} is set by env_test.xml and will be overwritten.  Use --file env_test.xml to change the value in the test.".format(xmlid))
 
     type_str = case.get_type_info(xmlid)
     if append:
@@ -143,8 +146,28 @@ def xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun)
         xmlval = convert_to_type(xmlval, type_str, xmlid)
 
     if not dryrun:
-        newval = case.set_value(xmlid, xmlval, subgroup, ignore_type=force)
-        expect(newval is not None,"No variable \"%s\" found"%xmlid)
+        result = case.set_value(xmlid, xmlval, subgroup, ignore_type=force, return_file=True)
+        expect(result is not None,"No variable \"%s\" found"%xmlid)
+        filename = result[1]
+
+        setup_already_run = os.path.exists(get_batch_script_for_job(case.get_primary_job()))
+        build_already_run = case.get_value("BUILD_COMPLETE")
+
+        if filename.endswith("env_build.xml") and build_already_run:
+            logger.info(
+"""For your changes to take effect, run:
+./case.build --clean-all
+./case.build""")
+
+        elif filename.endswith("env_mach_pes.xml"):
+            if setup_already_run:
+                logger.info("For your changes to take effect, run:\n./case.setup --reset")
+            if build_already_run:
+                if not setup_already_run:
+                    logger.info("For your changes to take effect, run:")
+
+                logger.info("./case.build --clean-all\n./case.build")
+
     else:
         logger.warning("'%s' = '%s'" , xmlid , xmlval )
 
@@ -160,10 +183,15 @@ def xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun)
 def xmlchange(caseroot, listofsettings, xmlfile, xmlid, xmlval, subgroup,
               append, noecho, force, dryrun):
 
-    with Case(caseroot, read_only=False) as case:
+    with Case(caseroot, read_only=False, record=True) as case:
         comp_classes = case.get_values("COMP_CLASSES")
+        env_test = None
+        if (case.get_value("TEST") and os.path.exists(os.path.join(caseroot,"env_test.xml"))) and not (xmlfile or xmlfile == "env_test.xml"):
+            env_test = case.get_env("test")
+
         if xmlfile:
             case.set_file(xmlfile)
+
         case.set_comp_classes(comp_classes)
 
         if len(listofsettings):
@@ -176,9 +204,9 @@ def xmlchange(caseroot, listofsettings, xmlfile, xmlid, xmlval, subgroup,
                 expect(len(pair) == 2 , "Expecting a key value pair in the form of key=value. Got %s" % (pair) )
                 (xmlid, xmlval) = pair
 
-                xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun)
+                xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun, env_test)
         else:
-            xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun)
+            xmlchange_single_value(case, xmlid, xmlval, subgroup, append, force, dryrun, env_test)
 
     if not noecho:
         argstr = ""

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 from __future__ import print_function
 import os, sys
 _CIMEROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../..")
@@ -8,12 +8,11 @@ sys.path.append(os.path.join(_CIMEROOT, "scripts", "fortran_unit_testing", "pyth
 
 from standard_script_setup import *
 from CIME.BuildTools.configure import configure, FakeCase
-from CIME.utils import run_cmd_no_fail, stringify_bool, expect
+from CIME.utils import run_cmd_no_fail, stringify_bool, expect, get_src_root
 from CIME.XML.machines import Machines
 from CIME.XML.compilers import Compilers
 from CIME.XML.env_mach_specific import EnvMachSpecific
 from xml_test_list import TestSuiteSpec, suites_from_xml
-import subprocess
 import socket
 #=================================================
 # Standard library modules.
@@ -57,6 +56,10 @@ runs "make clean"."""
                         )
     parser.add_argument("--cmake-args",
                         help="""Additional arguments to pass to CMake."""
+                        )
+    parser.add_argument("--comp-interface",
+                        default="mct",
+                        help="""The cime driver/cpl interface to use."""
                         )
     parser.add_argument("--color", action="store_true",
                         default=sys.stdout.isatty(),
@@ -143,7 +146,7 @@ override the command provided by Machines."""
     return output, args.build_dir, args.build_optimized, args.clean,\
         args.cmake_args, args.compiler, args.enable_genf90, args.machine, args.machines_dir,\
         args.make_j, args.use_mpi, args.mpilib, args.mpirun_command, args.test_spec_dir, args.ctest_args,\
-        args.use_openmp, args.xml_test_list, args.verbose
+        args.use_openmp, args.xml_test_list, args.verbose, args.comp_interface
 
 
 def cmake_stage(name, test_spec_dir, build_optimized, use_mpiserial, mpirun_command, output, pfunit_path,
@@ -179,6 +182,7 @@ def cmake_stage(name, test_spec_dir, build_optimized, use_mpiserial, mpirun_comm
             "-C Macros.cmake",
             test_spec_dir,
             "-DCIMEROOT="+_CIMEROOT,
+            "-DSRC_ROOT="+get_src_root(),
             "-DCIME_CMAKE_MODULE_DIRECTORY="+os.path.abspath(os.path.join(_CIMEROOT,"src","CMake")),
             "-DCMAKE_BUILD_TYPE="+build_type,
             "-DPFUNIT_MPIRUN='"+mpirun_command+"'",
@@ -202,7 +206,7 @@ def cmake_stage(name, test_spec_dir, build_optimized, use_mpiserial, mpirun_comm
         if cmake_args is not None:
             cmake_command.extend(cmake_args.split(" "))
 
-        run_cmd_no_fail(" ".join(cmake_command), verbose=True, arg_stdout=None, arg_stderr=subprocess.STDOUT)
+        run_cmd_no_fail(" ".join(cmake_command), combine_output=True)
 
 def make_stage(name, output, make_j, clean=False, verbose=True):
     """Run make in the current working directory.
@@ -221,7 +225,7 @@ def make_stage(name, output, make_j, clean=False, verbose=True):
     if verbose:
         make_command.append("VERBOSE=1")
 
-    run_cmd_no_fail(" ".join(make_command), arg_stdout=None, arg_stderr=subprocess.STDOUT)
+    run_cmd_no_fail(" ".join(make_command), combine_output=True)
 
 def find_pfunit(compilerobj, mpilib, use_openmp):
     """Find the pfunit installation we'll be using, and print its path
@@ -234,7 +238,7 @@ def find_pfunit(compilerobj, mpilib, use_openmp):
     - use_openmp: Boolean
     """
     attrs = {"MPILIB": mpilib,
-             "compile_threaded": "true" if use_openmp else "false"
+             "compile_threaded": "TRUE" if use_openmp else "FALSE"
              }
 
     pfunit_path = compilerobj.get_optional_compiler_node("PFUNIT_PATH", attributes=attrs)
@@ -253,7 +257,7 @@ def _main():
     output, build_dir, build_optimized, clean,\
         cmake_args, compiler, enable_genf90, machine, machines_dir,\
         make_j, use_mpi, mpilib, mpirun_command, test_spec_dir, ctest_args,\
-        use_openmp, xml_test_list, verbose \
+        use_openmp, xml_test_list, verbose, comp_interface \
         = parse_command_line(sys.argv)
 
 #=================================================
@@ -323,20 +327,14 @@ def _main():
     # Create the environment, and the Macros.cmake file
     #
     #
-    configure(machobj, build_dir, ["CMake"], compiler, mpilib, debug, os_,
-              unit_testing=True)
+    configure(machobj, build_dir, ["CMake"], compiler, mpilib, debug,
+              comp_interface, os_, unit_testing=True)
     machspecific = EnvMachSpecific(build_dir, unit_testing=True)
 
-    fake_case = FakeCase(compiler, mpilib, debug)
+    fake_case = FakeCase(compiler, mpilib, debug, comp_interface)
     machspecific.load_env(fake_case)
-    os.environ["OS"] = os_
-    os.environ["COMPILER"] = compiler
-    os.environ["DEBUG"] = stringify_bool(debug)
-    os.environ["MPILIB"] = mpilib
-    if use_openmp:
-        os.environ["compile_threaded"] = "true"
-    else:
-        os.environ["compile_threaded"] = "false"
+    cmake_args = "{}-DOS={} -DCOMPILER={} -DDEBUG={} -DMPILIB={} -Dcompile_threaded={}".format(
+        "" if not cmake_args else " ", os_, compiler, stringify_bool(debug), mpilib, stringify_bool(use_openmp))
 
     os.environ["UNIT_TEST_HOST"] = socket.gethostname()
     if "NETCDF_PATH" in os.environ and not "NETCDF" in os.environ:
@@ -345,6 +343,12 @@ def _main():
         logger.info("Setting NETCDF environment variable: {}".format(os.environ["NETCDF_PATH"]))
         os.environ["NETCDF"] = os.environ["NETCDF_PATH"]
 
+    if "NETCDFROOT" in os.environ and not "NETCDF" in os.environ:
+        # The CMake Netcdf find utility that we use (from pio2) seems to key off
+        # of the environment variable NETCDF, but not NETCDFROOT
+        logger.info("Setting NETCDF environment variable: {}".format(os.environ["NETCDFROOT"]))
+        os.environ["NETCDF"] = os.environ["NETCDFROOT"]
+
     if not use_mpi:
         mpirun_command = ""
     elif mpirun_command is None:
@@ -352,11 +356,12 @@ def _main():
             "compiler" : compiler,
             "mpilib"   : mpilib,
             "threaded" : use_openmp,
+            "comp_interface" : comp_interface,
             "unit_testing" : True
         }
 
         # We can get away with specifying case=None since we're using exe_only=True
-        mpirun_command, _ = machspecific.get_mpirun(None, mpi_attribs, None, exe_only=True)
+        mpirun_command, _, _, _ = machspecific.get_mpirun(None, mpi_attribs, None, exe_only=True)
         mpirun_command = machspecific.get_resolved_value(mpirun_command)
         logger.info("mpirun command is '{}'".format(mpirun_command))
 
@@ -406,8 +411,9 @@ def _main():
             if ctest_args is not None:
                 ctest_command.extend(ctest_args.split(" "))
 
-            run_cmd_no_fail(" ".join(ctest_command), from_dir=label, arg_stdout=None, arg_stderr=subprocess.STDOUT)
-
+            logger.info("Running '{}'".format(" ".join(ctest_command)))
+            output = run_cmd_no_fail(" ".join(ctest_command), from_dir=label, combine_output=True)
+            logger.info(output)
 
 if __name__ == "__main__":
     _main()

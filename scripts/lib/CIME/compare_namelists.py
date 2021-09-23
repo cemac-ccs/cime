@@ -1,7 +1,7 @@
 import os, re, logging, six
 
 from collections import OrderedDict
-from CIME.utils  import expect
+from CIME.utils  import expect, CIMEError
 logger=logging.getLogger(__name__)
 
 # pragma pylint: disable=unsubscriptable-object
@@ -20,7 +20,19 @@ def _normalize_lists(value_str):
     "'one two'"
     >>> _normalize_lists("1 2  3, 4 ,  5")
     '1,2,3,4,5'
+    >>> _normalize_lists("2, 2*13")
+    '2,2*13'
+    >>> _normalize_lists("'DMS -> 1.0 * value.nc'")
+    "'DMS -> 1.0 * value.nc'"
+    >>> _normalize_lists("1.0* value.nc")
+    '1.0*value.nc'
+    >>> _normalize_lists("1.0*value.nc")
+    '1.0*value.nc'
     """
+    # Handle special case "value * value" which should not be treated as list
+    parsed = re.match(r"^([^*=->\s]*)\s*(\*)\s*(.*)$", value_str)
+    if parsed is not None:
+        value_str = "".join(parsed.groups())
     result = ""
     inside_quotes = False
     idx = 0
@@ -51,8 +63,22 @@ def _normalize_lists(value_str):
 ###############################################################################
 def _interpret_value(value_str, filename):
 ###############################################################################
+    """
+    >>> _interpret_value("one", "foo")
+    'one'
+    >>> _interpret_value("one, two", "foo")
+    ['one', 'two']
+    >>> _interpret_value("3*1.0", "foo")
+    ['1.0', '1.0', '1.0']
+    >>> _interpret_value("'DMS -> value.nc'", "foo")
+    OrderedDict([('DMS', 'value.nc')])
+    >>> _interpret_value("'DMS -> 1.0 * value.nc'", "foo")
+    OrderedDict([('DMS', '1.0*value.nc')])
+    >>> _interpret_value("'DMS -> 1.0* value.nc'", "foo")
+    OrderedDict([('DMS', '1.0*value.nc')])
+    """
     comma_re = re.compile(r'\s*,\s*')
-    dict_re = re.compile(r"^'(\S+)\s*->\s*(\S+)\s*'")
+    dict_re = re.compile(r"^'(\S+)\s*->\s*(\S+|(?:\S+\s*\*\s*\S+))\s*'")
 
     value_str = _normalize_lists(value_str)
 
@@ -77,7 +103,7 @@ def _interpret_value(value_str, filename):
                     sub_tokens = [item.strip() for item in token.split("*")]
                     expect(len(sub_tokens) == 2, "Incorrect usage of multiplication in token '{}'".format(token))
                     new_tokens.extend([sub_tokens[1]] * int(sub_tokens[0]))
-                except:
+                except Exception:
                     # User probably did not intend to use the * operator as a namelist multiplier
                     new_tokens.append(token)
             else:
@@ -124,36 +150,36 @@ def _parse_namelists(namelist_lines, filename):
     >>> _parse_namelists(teststr.splitlines(), 'foo')
     OrderedDict([('fire_emis_nl', OrderedDict([('fire_emis_factors_file', "'fire_emis_factors_c140116.nc'"), ('fire_emis_specifier', ["'bc_a1 = BC'", "'pom_a1 = 1.4*OC'", "'pom_a2 = A*B*C'", "'SO2 = SO2'"])]))])
 
-    >>> _parse_namelists('blah', 'foo')
+    >>> _parse_namelists('blah', 'foo') # doctest: +IGNORE_EXCEPTION_DETAIL
     Traceback (most recent call last):
         ...
-    SystemExit: ERROR: File 'foo' does not appear to be a namelist file, skipping
+    CIMEError: ERROR: File 'foo' does not appear to be a namelist file, skipping
 
     >>> teststr = '''&nml
     ... val = 'one', 'two',
     ... val2 = 'three'
     ... /'''
-    >>> _parse_namelists(teststr.splitlines(), 'foo')
+    >>> _parse_namelists(teststr.splitlines(), 'foo') # doctest: +IGNORE_EXCEPTION_DETAIL
     Traceback (most recent call last):
         ...
-    SystemExit: ERROR: In file 'foo', Incomplete multiline variable: 'val'
+    CIMEError: ERROR: In file 'foo', Incomplete multiline variable: 'val'
 
     >>> teststr = '''&nml
     ... val = 'one', 'two',
     ... /'''
-    >>> _parse_namelists(teststr.splitlines(), 'foo')
+    >>> _parse_namelists(teststr.splitlines(), 'foo') # doctest: +IGNORE_EXCEPTION_DETAIL
     Traceback (most recent call last):
         ...
-    SystemExit: ERROR: In file 'foo', Incomplete multiline variable: 'val'
+    CIMEError: ERROR: In file 'foo', Incomplete multiline variable: 'val'
 
     >>> teststr = '''&nml
     ... val = 'one', 'two',
     ...       'three -> four'
     ... /'''
-    >>> _parse_namelists(teststr.splitlines(), 'foo')
+    >>> _parse_namelists(teststr.splitlines(), 'foo') # doctest: +IGNORE_EXCEPTION_DETAIL
     Traceback (most recent call last):
         ...
-    SystemExit: ERROR: In file 'foo', multiline list variable 'val' had dict entries
+    CIMEError: ERROR: In file 'foo', multiline list variable 'val' had dict entries
 
     >>> teststr = '''&nml
     ... val = 2, 2*13
@@ -303,18 +329,21 @@ def _normalize_string_value(name, value, case):
         case_re = re.compile(r'{}[.]([GC]+)[.]([^./\s]+)'.format(case))
         value = case_re.sub("{}.ACTION.TESTID".format(case), value)
 
-    if (name in ["runid", "model_version", "username"]):
+    if (name in ["runid", "model_version", "username", "logfile"]):
         # Don't even attempt to diff these, we don't care
         return name.upper()
-    elif (".log." in value):
-        # Remove the part that's prone to diff
-        components = value.split(".")
-        return os.path.basename(".".join(components[0:-1]))
     elif (":" in value):
         items = value.split(":")
         items = [_normalize_string_value(name, item, case) for item in items]
         return ":".join(items)
     elif ("/" in value):
+        # Handle special format scale*path, normalize the path and reconstruct
+        parsed = re.match(r"^([^*]+\*)(/[^/]+)*", value)
+        if parsed is not None and len(parsed.groups()) == 2:
+            items = list(parsed.groups())
+            items[1] = os.path.basename(items[1])
+            return "".join(items)
+
         # File path, just return the basename unless its a seq_maps.rc mapping
         # mapname or maptype
         if "mapname" not in name and "maptype" not in name:
@@ -491,6 +520,30 @@ def _compare_namelists(gold_namelists, comp_namelists, case):
     ... /'''
     >>> _compare_namelists(_parse_namelists(teststr1.splitlines(), 'foo'), _parse_namelists(teststr2.splitlines(), 'bar'), 'ERB.f19_g16.B1850C5.sandiatoss3_intel')
     ''
+    >>> teststr1 = '''&nml
+    ... csw_specifier = 'DMS -> 1.0 * value.nc'
+    ... /'''
+    >>> _compare_namelists(_parse_namelists(teststr1.splitlines(), 'foo'),\
+    _parse_namelists(teststr1.splitlines(), 'foo'), "case")
+    ''
+    >>> teststr2 = '''&nml
+    ... csw_specifier = 'DMS -> 2.0 * value.nc'
+    ... /'''
+    >>> comments = _compare_namelists(_parse_namelists(teststr1.splitlines(), 'foo'),\
+    _parse_namelists(teststr2.splitlines(), 'foo'), "case")
+    >>> print(comments)
+      BASE: csw_specifier dict item DMS = 1.0*value.nc
+      COMP: csw_specifier dict item DMS = 2.0*value.nc
+    <BLANKLINE>
+    >>> teststr2 = '''&nml
+    ... csw_specifier = 'DMS -> 1.0 * other.nc'
+    ... /'''
+    >>> comments = _compare_namelists(_parse_namelists(teststr1.splitlines(), 'foo'),\
+    _parse_namelists(teststr2.splitlines(), 'foo'), "case")
+    >>> print(comments)
+      BASE: csw_specifier dict item DMS = 1.0*value.nc
+      COMP: csw_specifier dict item DMS = 1.0*other.nc
+    <BLANKLINE>
     """
     different_namelists = OrderedDict()
     for namelist, gold_names in gold_namelists.items():
@@ -544,7 +597,7 @@ def is_namelist_file(file_path):
 ###############################################################################
     try:
         compare_namelist_files(file_path, file_path)
-    except SystemExit as e:
+    except CIMEError as e:
         assert "does not appear to be a namelist file" in str(e), str(e)
         return False
     return True

@@ -165,7 +165,7 @@
       <directive> --nodes={{ num_nodes }}</directive>
       <directive> --ntasks-per-node={{ tasks_per_node }}</directive>
       <directive> --output={{ job_id }}   </directive>
-      <directive> --exclusive                        </directive>
+      <directive> --exclusive             </directive>
     </directives>
   </batch_system>
 
@@ -242,6 +242,49 @@
     </queues>
   </batch_system>
 
+  <!-- casper pbs -->
+  <batch_system MACH="casper" type="pbs">
+    <batch_submit>qsub</batch_submit>
+
+    <directives queue="casper" compiler="pgi-gpu">
+      <!-- Turn on MPS server manually -->
+      <!-- This is a temporary solution and should be removed once MPS is integrated into PBS on Casper -->
+      <directive default="/bin/bash" > -S /glade/u/apps/dav/opt/nvidia-mps/mps_bash </directive>
+      <directive> -l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:mem=700GB:ngpus={{ ngpus_per_node }} </directive>
+      <directive> -l gpu_type=v100 </directive>
+    </directives>
+
+    <directives queue="casper" compiler="nvhpc-gpu">
+      <!-- Turn on MPS server manually -->
+      <!-- This is a temporary solution and should be removed once MPS is integrated into PBS on Casper -->
+      <directive default="/bin/bash" > -S /glade/u/apps/dav/opt/nvidia-mps/mps_bash </directive>
+      <directive> -l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:mem=700GB:ngpus={{ ngpus_per_node }} </directive>
+      <directive> -l gpu_type=v100 </directive>
+    </directives>
+
+    <directives queue="casper" compiler="nvhpc">
+      <directive default="/bin/bash" > -S {{ shell }} </directive>
+      <directive> -l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:mem=700GB:ngpus={{ ngpus_per_node }} </directive>
+    </directives>
+
+    <directives queue="casper" compiler="pgi">
+      <directive default="/bin/bash" > -S {{ shell }} </directive>
+      <directive> -l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:mem=700GB:ngpus={{ ngpus_per_node }} </directive>
+    </directives>
+
+    <directives queue="casper" compiler="intel">
+      <directive default="/bin/bash" > -S {{ shell }} </directive>
+      <directive> -l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:mem=700GB:ngpus={{ ngpus_per_node }} </directive>
+    </directives>
+
+    <!-- Unknown queues use the batch directives for the regular queue -->
+    <unknown_queue_directives>casper</unknown_queue_directives>
+
+    <queues>
+      <queue walltimemax="12:00:00" nodemin="1" nodemax="10">casper</queue>
+    </queues>
+  </batch_system>
+
   <batch_system MACH="cheyenne" type="pbs">
     <directives queue="regular">
       <directive default="/bin/bash" > -S {{ shell }}  </directive>
@@ -271,6 +314,30 @@
       <queue walltimemax="12:00:00" nodemin="1" nodemax="4032">premium</queue>
       <queue default="true" walltimemax="06:00:00" jobmin="1" jobmax="18">share</queue>
       <queue walltimemax="12:00:00" nodemin="1" nodemax="4032">economy</queue>
+    </queues>
+  </batch_system>
+
+  <!-- coeus slurm -->
+  <batch_system MACH="coeus" type="slurm" >
+    <batch_query per_job_arg="-j">squeue</batch_query>
+    <batch_submit>sbatch</batch_submit>
+    <batch_cancel>scancel</batch_cancel>
+    <batch_directive>#SBATCH</batch_directive>
+    <jobid_pattern>(\d+)$</jobid_pattern>
+    <depend_separator>,</depend_separator>
+    <walltime_format>%H:%M:%S</walltime_format>
+    <batch_mail_flag>--mail-user</batch_mail_flag>
+    <batch_mail_type_flag>--mail-type</batch_mail_type_flag>
+    <batch_mail_type>none, all, begin, end, fail</batch_mail_type>
+    <directives>
+      <directive> --job-name={{ job_id }}</directive>
+      <directive> --nodes={{ num_nodes }}</directive>
+      <directive> --ntasks-per-node={{ tasks_per_node }}</directive>
+      <directive> --output={{ job_id }}   </directive>
+      <directive> --exclusive                        </directive>
+    </directives>
+    <queues>
+      <queue nodemin="1" nodemax="96" default="true">medium</queue>
     </queues>
   </batch_system>
 
@@ -385,6 +452,27 @@
       <queue walltimemax="03:59:00" >normal.4h</queue>
     </queues>
   </batch_system>
+
+  <batch_system MACH="frontera" type="slurm" >
+    <!-- note this form of batch_submit causes some tests to fail on the system 
+    because env variables are not forwarded -->
+    <batch_submit>ssh login1 cd $CASEROOT ; sbatch</batch_submit>
+    <submit_args>
+      <arg flag="--time" name="$JOB_WALLCLOCK_TIME"/>
+      <arg flag="-p" name="$JOB_QUEUE"/>
+      <arg flag="--account" name="$PROJECT"/>
+    </submit_args>
+    <directives>
+      <directive> --export=ALL            </directive>
+    </directives>
+
+    <queues>
+      <queue walltimemax="02:00:00" nodemin="1" nodemax="40">development</queue>
+      <queue walltimemax="24:00:00" nodemin="1" nodemax="512" default="true">normal</queue>
+      <queue walltimemax="24:00:00" nodemin="513" nodemax="2048" >large</queue>
+    </queues>
+  </batch_system>
+
   <!-- gaea is PBS -->
   <batch_system MACH="gaea" type="pbs" >
     <directives>
@@ -399,6 +487,36 @@
     <queues>
       <queue walltimemax="01:00:00" nodemin="1" nodemax="35">debug</queue>
       <queue walltimemax="24:00:00" nodemin="861" nodemax="4166" default="true">batch</queue>
+    </queues>
+  </batch_system>
+
+  <!-- GreenPlanet is SLURM -->
+  <batch_system type="slurm" MACH="greenplanet-sib29">
+    <batch_submit>sbatch</batch_submit>
+    <submit_args>
+      <arg flag="--time" name="$JOB_WALLCLOCK_TIME"/>
+      <arg flag="-p" name="$JOB_QUEUE"/>
+    </submit_args>
+    <queues>
+      <!-- Want case.st_archiver to run on first available queue, but case.run to use sib2.9
+           We achieve this setting both queues as the default queue but limiting it
+           to jobs that use 8 tasks or fewer; other jobs will land in sib2.9        -->
+      <queue nodemin="1" nodemax="45">sib2.9</queue>
+      <queue default="true" jobmin="1" jobmax="8">sib2.9,sky2.4</queue>
+    </queues>
+  </batch_system>
+  <batch_system type="slurm" MACH="greenplanet-sky24">
+    <batch_submit>sbatch</batch_submit>
+    <submit_args>
+      <arg flag="--time" name="$JOB_WALLCLOCK_TIME"/>
+      <arg flag="-p" name="$JOB_QUEUE"/>
+    </submit_args>
+    <queues>
+      <!-- Want case.st_archiver to run on first available queue, but case.run to use sky2.4
+           We achieve this setting both queues as the default queue but limiting it
+           to jobs that use 8 tasks or fewer; other jobs will land in sky2.4        -->
+      <queue nodemin="1" nodemax="13">sky2.4</queue>
+      <queue default="true" jobmin="1" jobmax="8">sib2.9,sky2.4</queue>
     </queues>
   </batch_system>
 
@@ -419,7 +537,8 @@
   </batch_system>
 
   <batch_system type="pbs" MACH="izumi" >
-    <batch_submit>ssh izumi cd $CASEROOT ; qsub</batch_submit>
+    <batch_submit>qsub</batch_submit>
+    <jobid_pattern>(\d+.izumi.unified.ucar.edu)$</jobid_pattern>
     <directives>
       <directive>-l nodes={{ num_nodes }}:ppn={{ tasks_per_node }}</directive>
       <directive default="/bin/bash" > -S {{ shell }}  </directive>
@@ -515,50 +634,62 @@
 
   <!-- NAS pleiades machines -->
   <batch_system type="pbs" MACH="pleiades-bro" >
+    <submit_args>
+      <arg flag="-W group_list=" name="$PROJECT"/>
+    </submit_args>
     <directives>
-      <directive>-W group_list=$PROJECT</directive>
       <directive>-l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:model=bro</directive>
       <directive>-l place=scatter:excl</directive>
       <directive default="/bin/bash" > -S {{ shell }}  </directive>
     </directives>
     <queues>
-      <queue walltimemin="" walltimemax="08:00:00" nodemin="0" nodemax="357" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="08:00:00" nodemin="1" nodemax="5256" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="02:00:00" nodemin="1" nodemax="1800" default="false">devel</queue>
     </queues>
   </batch_system>
 
   <batch_system type="pbs" MACH="pleiades-has" >
+    <submit_args>
+      <arg flag="-W group_list=" name="$PROJECT"/>
+    </submit_args>
     <directives>
-      <directive>-W group_list=$PROJECT</directive>
       <directive>-l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:model=has</directive>
       <directive>-l place=scatter:excl</directive>
       <directive default="/bin/bash" > -S {{ shell }}  </directive>
     </directives>
     <queues>
-      <queue walltimemin="" walltimemax="08:00:00" nodemin="0" nodemax="357" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="08:00:00" nodemin="1" nodemax="5256" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="02:00:00" nodemin="1" nodemax="1800" default="false">devel</queue>
     </queues>
   </batch_system>
 
   <batch_system type="pbs" MACH="pleiades-ivy" >
+    <submit_args>
+      <arg flag="-W group_list=" name="$PROJECT"/>
+    </submit_args>
     <directives>
-      <directive>-W group_list=$PROJECT </directive>
       <directive>-l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:model=ivy</directive>
       <directive>-l place=scatter:excl</directive>
       <directive default="/bin/bash" > -S {{ shell }}  </directive>
     </directives>
     <queues>
-      <queue walltimemin="" walltimemax="08:00:00" nodemin="0" nodemax="500" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="08:00:00" nodemin="1" nodemax="5256" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="02:00:00" nodemin="1" nodemax="1800" default="false">devel</queue>
     </queues>
   </batch_system>
 
   <batch_system type="pbs" MACH="pleiades-san" >
+    <submit_args>
+      <arg flag="-W group_list=" name="$PROJECT"/>
+    </submit_args>
     <directives>
-      <directive>-W group_list=$PROJECT </directive>
       <directive>-l select={{ num_nodes }}:ncpus={{ max_tasks_per_node }}:mpiprocs={{ tasks_per_node }}:ompthreads={{ thread_count }}:model=san</directive>
       <directive>-l place=scatter:excl</directive>
       <directive default="/bin/bash" > -S {{ shell }}  </directive>
     </directives>
     <queues>
-      <queue walltimemin="" walltimemax="08:00:00" nodemin="0" nodemax="624" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="08:00:00" nodemin="1" nodemax="5256" default="true">normal</queue>
+      <queue walltimemin="" walltimemax="02:00:00" nodemin="1" nodemax="1800" default="false">devel</queue>
     </queues>
   </batch_system>
 
@@ -588,12 +719,18 @@
     </queues>
   </batch_system>
 
-  <batch_system type="pbs" MACH="theia" >
+  <batch_system MACH="theia" type="slurm" >
+    <batch_submit>sbatch</batch_submit>
     <submit_args>
-      <arg flag="-l procs=" name=" $TOTALPES"/>
+      <arg flag="--time" name="$JOB_WALLCLOCK_TIME"/>
+      <arg flag="-q" name="$JOB_QUEUE"/>
+      <arg flag="--account" name="$PROJECT"/>
     </submit_args>
+    <directives>
+      <directive>--partition=theia</directive>
+    </directives>
     <queues>
-      <queue walltimemax="01:00:00" nodemin="1" nodemax="35">batch</queue>
+      <queue walltimemax="01:00:00" nodemin="1" nodemax="171">batch</queue>
     </queues>
   </batch_system>
 
@@ -602,4 +739,36 @@
       <queue walltimemax="00:60:00" nodemin="1" nodemax="50" default="true">default</queue>
     </queues>
   </batch_system>
+  <batch_system MACH="thunder" type="slurm">
+    <batch_submit>sbatch</batch_submit>
+    <submit_args>
+      <arg flag="--time" name="$JOB_WALLCLOCK_TIME"/>
+      <arg flag="-q" name="$JOB_QUEUE"/>
+    </submit_args>
+    <directives>
+      <directive>--ntasks-per-node=64</directive>
+      <directive>--hint=nomultithread</directive>
+    </directives>
+    <queues>
+      <queue walltimemax="02:00:00" nodemin="1" nodemax="4" default="true">regular</queue>
+    </queues>
+  </batch_system>      
+
+  <batch_system MACH="zeus" type="lsf">
+    <batch_env>-env</batch_env>
+    <submit_args>
+      <arg flag="-q" name="$JOB_QUEUE"/>
+      <arg flag="-W" name="$JOB_WALLCLOCK_TIME"/>
+      <arg flag="-P" name="$PROJECT"/>
+    </submit_args>
+    <directives>
+      <directive                       > -R "span[ptile={{ tasks_per_node }}]"</directive>
+    </directives>
+    <queues>
+      <queue walltimemin="00:00" walltimemax="02:00" default="true">p_short</queue>
+      <queue walltimemin="02:00" walltimemax="04:00">p_medium</queue>
+      <queue walltimemin="04:00" walltimemax="08:00">p_long</queue>
+    </queues>
+  </batch_system>
+
 </config_batch>

@@ -25,6 +25,38 @@ logger = logging.getLogger(__name__)
 
 _array_size_re = re.compile(r'^(?P<type>[^(]+)\((?P<size>[^)]+)\)$')
 
+class CaseInsensitiveDict(dict):
+
+    """Basic case insensitive dict with strings only keys.
+        From https://stackoverflow.com/a/27890005 """
+
+    proxy = {}
+
+    def __init__(self, data):
+        dict.__init__(self)
+        self.proxy = dict((k.lower(), k) for k in data)
+        for k in data:
+            self[k] = data[k]
+
+    def __contains__(self, k):
+        return k.lower() in self.proxy
+
+    def __delitem__(self, k):
+        key = self.proxy[k.lower()]
+        super(CaseInsensitiveDict, self).__delitem__(key)
+        del self.proxy[k.lower()]
+
+    def __getitem__(self, k):
+        key = self.proxy[k.lower()]
+        return super(CaseInsensitiveDict, self).__getitem__(key)
+
+    def get(self, k, default=None):
+        return self[k] if k in self else default
+
+    def __setitem__(self, k, v):
+        super(CaseInsensitiveDict, self).__setitem__(k, v)
+        self.proxy[k.lower()] = k
+
 class NamelistDefinition(EntryID):
 
     """Class representing variable definitions for a namelist.
@@ -54,8 +86,16 @@ class NamelistDefinition(EntryID):
         self._entry_ids = []
         self._valid_values = {}
         self._entry_types = {}
-        self._group_names = {}
+        self._group_names = CaseInsensitiveDict({})
         self._nodes = {}
+
+    def set_node_values(self, name, node):
+        self._entry_nodes.append(node)
+        self._entry_ids.append(name)
+        self._nodes[name] = node
+        self._entry_types[name] = self._get_type(node)
+        self._valid_values[name] = self._get_valid_values(node)
+        self._group_names[name] = self.get_group_name(node)
 
     def set_nodes(self, skip_groups=None):
         """
@@ -67,29 +107,24 @@ class NamelistDefinition(EntryID):
             name = self.get(node, "id")
             skip_default_entry = self.get(node, "skip_default_entry") == "true"
             per_stream_entry = self.get(node, "per_stream_entry") == "true"
-            set_node_values = False
+
             if skip_groups:
-                group_name = self._get_group_name(node)
+                group_name = self.get_group_name(node)
+
                 if not group_name in skip_groups:
-                    self._entry_nodes.append(node)
-                    set_node_values = True
+                    self.set_node_values(name, node)
+
                     if not skip_default_entry and not per_stream_entry:
                         default_nodes.append(node)
             else:
-                self._entry_nodes.append(node)
-                set_node_values = True
+                self.set_node_values(name, node)
+
                 if not skip_default_entry and not per_stream_entry:
                     default_nodes.append(node)
-            if set_node_values:
-                self._entry_nodes.append(node)
-                self._entry_ids.append(name)
-                self._nodes[name] = node
-                self._entry_types[name] = self._get_type(node)
-                self._valid_values[name] = self._get_valid_values(node)
-                self._group_names[name] = self._get_group_name(node)
+
         return default_nodes
 
-    def _get_group_name(self, node=None):
+    def get_group_name(self, node=None):
         if self.get_version() == 1.0:
             group = self.get(node, 'group')
         elif self.get_version() >= 2.0:
@@ -124,6 +159,10 @@ class NamelistDefinition(EntryID):
     def add_attributes(self, attributes):
         self._attributes = attributes
 
+    def get_attributes(self):
+        """Return this object's attributes dictionary"""
+        return self._attributes
+
     def get_entry_nodes(self):
         return self._entry_nodes
 
@@ -142,6 +181,9 @@ class NamelistDefinition(EntryID):
         """This function is not implemented."""
         raise TypeError("NamelistDefinition does not support `set_value`.")
 
+    # In contrast to the entry_id version of this method, this version doesn't support the
+    # replacement_for_none argument, because it is hard-coded to ''.
+    # pylint: disable=arguments-differ
     def get_value_match(self, vid, attributes=None, exact_match=True, entry_node=None):
         """Return the default value for the variable named `vid`.
 
@@ -158,11 +200,12 @@ class NamelistDefinition(EntryID):
 
         if entry_node is None:
             entry_node = self._nodes[vid]
+        # NOTE(wjs, 2021-06-04) In the following call, replacement_for_none='' may not
+        # actually be needed, but I'm setting it to maintain some old logic, to be safe.
         value = super(NamelistDefinition, self).get_value_match(vid.lower(),attributes=all_attributes, exact_match=exact_match,
-                                                                entry_node=entry_node)
-        if value is None:
-            value = ''
-        else:
+                                                                entry_node=entry_node,
+                                                                replacement_for_none='')
+        if value is not None:
             value =  self._split_defaults_text(value)
 
         return value
@@ -260,7 +303,6 @@ class NamelistDefinition(EntryID):
         appear in the namelist (even for scalar variables, in which case the
         length of the list is always 1).
         """
-        name = name.lower()
         # Separate into a type, optional length, and optional size.
         type_, max_len, size = self.split_type_string(name)
         invalid = []
@@ -305,7 +347,9 @@ class NamelistDefinition(EntryID):
         return True
 
     def _expect_variable_in_definition(self, name, variable_template):
-        """Used to get a better error message for an unexpected variable."""
+        """Used to get a better error message for an unexpected variable.
+             case insensitve match"""
+
         expect(name in self._entry_ids,
                (variable_template + " is not in the namelist definition.").format(str(name)))
 
@@ -412,4 +456,4 @@ class NamelistDefinition(EntryID):
             all_attributes.update(attribute)
 
         value = self.get_value_match(item.lower(), all_attributes, True)
-        return self._split_defaults_text(value)
+        return value

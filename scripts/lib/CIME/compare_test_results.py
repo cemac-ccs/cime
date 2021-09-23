@@ -1,10 +1,11 @@
 import CIME.compare_namelists, CIME.simple_compare
-from CIME.utils import expect, append_status, EnvironmentContext
+from CIME.utils import append_status, EnvironmentContext, parse_test_name
 from CIME.test_status import *
-from CIME.hist_utils import compare_baseline
+from CIME.hist_utils import compare_baseline, get_ts_synopsis
 from CIME.case import Case
+from CIME.test_utils import get_test_status_files
 
-import os, glob, logging
+import os, logging
 
 ###############################################################################
 def append_status_cprnc_log(msg, logfile_name, test_dir):
@@ -58,9 +59,7 @@ def compare_test_results(baseline_name, baseline_root, test_root, compiler, test
     Returns True if all tests generated either PASS or SKIP results, False if
     there was at least one FAIL result.
     """
-    test_id_glob = "*{}*".format(compiler) if test_id is None else "*{}".format(test_id)
-    test_status_files = glob.glob("{}/{}/{}".format(test_root, test_id_glob, TEST_STATUS_FILENAME))
-    expect(test_status_files, "No matching test cases found in for {}/{}/{}".format(test_root, test_id_glob, TEST_STATUS_FILENAME))
+    test_status_files = get_test_status_files(test_root, compiler, test_id=test_id)
 
     # ID to use in the log file names, to avoid file name collisions with
     # earlier files that may exist.
@@ -72,6 +71,10 @@ def compare_test_results(baseline_name, baseline_root, test_root, compiler, test
         test_dir = os.path.dirname(test_status_file)
         ts = TestStatus(test_dir=test_dir)
         test_name = ts.get_name()
+        testopts = parse_test_name(test_name)[1]
+        testopts = [] if testopts is None else testopts
+        build_only = "B" in testopts
+
         if (compare_tests in [[], None] or CIME.utils.match_any(test_name, compare_tests)):
 
             if (not hist_only):
@@ -88,7 +91,7 @@ def compare_test_results(baseline_name, baseline_root, test_root, compiler, test
                 nl_do_compare = False
 
             detailed_comments = ""
-            if (not namelists_only):
+            if (not namelists_only and not build_only):
                 compare_result = None
                 compare_comment = ""
                 run_result = ts.get_status(RUN_PHASE)
@@ -105,48 +108,43 @@ def compare_test_results(baseline_name, baseline_root, test_root, compiler, test
             else:
                 do_compare = False
 
+            with Case(test_dir) as case:
+                if baseline_name is None:
+                    baseline_name = case.get_value("BASELINE_NAME_CMP")
+                    if not baseline_name:
+                        baseline_name = CIME.utils.get_current_branch(repo=CIME.utils.get_cime_root())
+
+                if baseline_root is None:
+                    baseline_root = case.get_value("BASELINE_ROOT")
+
+                logfile_name = "compare.log.{}.{}".format(baseline_name.replace("/", "_"), log_id)
+
+                append_status_cprnc_log(
+                    "Comparing against baseline with compare_test_results:\n"
+                    "Baseline: {}\n In baseline_root: {}".format(baseline_name, baseline_root),
+                    logfile_name,
+                    test_dir)
+
             if nl_do_compare or do_compare:
-                with Case(test_dir) as case:
+                if nl_do_compare:
+                    nl_success = compare_namelists(case, baseline_name, baseline_root, logfile_name)
+                    if nl_success:
+                        nl_compare_result = TEST_PASS_STATUS
+                        nl_compare_comment = ""
+                    else:
+                        nl_compare_result = TEST_FAIL_STATUS
+                        nl_compare_comment = "See {}/{}".format(test_dir, logfile_name)
+                        all_pass_or_skip = False
 
-                    if baseline_name is None:
-                        baseline_name = case.get_value("BASELINE_NAME_CMP")
-                        if not baseline_name:
-                            baseline_name = CIME.utils.get_current_branch(repo=CIME.utils.get_cime_root())
+                if do_compare:
+                    success, detailed_comments = compare_history(case, baseline_name, baseline_root, log_id)
+                    if success:
+                        compare_result = TEST_PASS_STATUS
+                    else:
+                        compare_result = TEST_FAIL_STATUS
+                        all_pass_or_skip = False
 
-                    if baseline_root is None:
-                        baseline_root = case.get_value("BASELINE_ROOT")
-
-                    logfile_name = "compare.log.{}.{}".format(baseline_name.replace("/", "_"), log_id)
-
-                    append_status_cprnc_log(
-                        "Comparing against baseline with compare_test_results:\n"
-                        "Baseline: {}\n In baseline_root: {}".format(baseline_name, baseline_root),
-                        logfile_name,
-                        test_dir)
-
-                    if nl_do_compare:
-                        nl_success = compare_namelists(case, baseline_name, baseline_root, logfile_name)
-                        if nl_success:
-                            nl_compare_result = TEST_PASS_STATUS
-                            nl_compare_comment = ""
-                        else:
-                            nl_compare_result = TEST_FAIL_STATUS
-                            nl_compare_comment = "See {}/{}".format(test_dir, logfile_name)
-                            all_pass_or_skip = False
-
-                    if do_compare:
-                        success, detailed_comments = compare_history(case, baseline_name, baseline_root, log_id)
-                        if success:
-                            compare_result = TEST_PASS_STATUS
-                        else:
-                            compare_result = TEST_FAIL_STATUS
-                            all_pass_or_skip = False
-
-                        # Following the logic in SystemTestsCommon._compare_baseline:
-                        # We'll print the comment if it's a brief one-liner; otherwise
-                        # the comment will only appear in the log file
-                        if "\n" not in detailed_comments:
-                            compare_comment = detailed_comments
+                    compare_comment = get_ts_synopsis(detailed_comments)
 
             brief_result = ""
             if not hist_only:

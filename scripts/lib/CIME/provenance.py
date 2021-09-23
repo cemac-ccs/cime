@@ -1,11 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 Library for saving build/run provenance.
 """
 
 from CIME.XML.standard_module_setup import *
-from CIME.utils import touch, gzip_existing_file, SharedArea, copy_umask, convert_to_babylonian_time, get_current_commit, indent_string, run_cmd, run_cmd_no_fail
+from CIME.utils import touch, gzip_existing_file, SharedArea, convert_to_babylonian_time, get_current_commit, get_current_submodule_status, indent_string, run_cmd, run_cmd_no_fail, safe_copy
 
 import tarfile, getpass, signal, glob, shutil, sys
 
@@ -17,35 +17,139 @@ def _get_batch_job_id_for_syslog(case):
     """
     mach = case.get_value("MACH")
     try:
-        if mach in ['anvil', 'titan']:
-            return os.environ["PBS_JOBID"]
-        elif mach in ['edison', 'cori-haswell', 'cori-knl']:
+        if mach in ['anvil', 'chrysalis', 'compy', 'cori-haswell', 'cori-knl']:
             return os.environ["SLURM_JOB_ID"]
-        elif mach in ['mira', 'theta']:
+        elif mach in ['theta']:
             return os.environ["COBALT_JOBID"]
-    except:
+        elif mach in ['summit']:
+            return os.environ["LSB_JOBID"]
+    except KeyError:
         pass
 
     return None
 
+def _extract_times(zipfiles, target_file):
+
+    contents ="Target Build_time\n"
+    for zipfile in zipfiles:
+        stat, output, _ = run_cmd("zgrep 'built in' {}".format(zipfile))
+        if stat == 0:
+            for line in output.splitlines():
+                line = line.strip()
+                if line:
+                    items = line.split()
+                    target, the_time = items[1], items[-2]
+                    contents += "{} {}\n".format(target, the_time)
+
+    with open(target_file, "w") as fd:
+        fd.write(contents)
+
+def _run_git_cmd_recursively(cmd, srcroot, output):
+    """ Runs a git command recursively
+
+    Runs the git command in srcroot then runs it on each submodule.
+    Then output from both commands is written to the output file.
+    """
+    rc1, output1, err1 = run_cmd("git {}".format(cmd), from_dir=srcroot)
+
+    rc2, output2, err2 = run_cmd(
+        "git submodule foreach --recursive \"git {}; echo\"".format(cmd),
+        from_dir=srcroot)
+
+    with open(output, "w") as fd:
+        fd.write((output1 if rc1 == 0 else err1) + "\n\n")
+        fd.write((output2 if rc2 == 0 else err2) + "\n")
+
+def _parse_dot_git_path(srcroot):
+    dot_git_pattern = r"^(.*/\.git).*"
+
+    m = re.match(dot_git_pattern, srcroot)
+
+    expect(m is not None, f"Could not parse git path from {srcroot!r}")
+
+    return m.group(1)
+
+def _find_git_root(srcroot):
+    gitroot = f"{srcroot}/.git"
+
+    expect(os.path.exists(gitroot),
+           f"{srcroot!r} is not a git repository, failed to collect provenance")
+
+    # Handle normal git repositories
+    if os.path.isdir(gitroot):
+        return gitroot
+
+    # Handle git worktrees
+    with open(gitroot) as fd:
+        line = fd.readline()
+
+    gitdir_pattern = r"^gitdir:\s?(.*)$"
+
+    m = re.match(gitdir_pattern, line)
+
+    expect(m is not None, f"Could not determine git root in {srcroot!r}")
+
+    # First group is the actual gitroot
+    return m.group(1)
+
+def _record_git_provenance(srcroot, exeroot, lid):
+    """ Records git provenance
+
+    Records git status, diff and logs for main repo and all submodules.
+    """
+    # Git Status
+    status_prov = os.path.join(exeroot, "GIT_STATUS.{}".format(lid))
+    _run_git_cmd_recursively("status", srcroot, status_prov)
+
+    # Git Diff
+    diff_prov = os.path.join(exeroot, "GIT_DIFF.{}".format(lid))
+    _run_git_cmd_recursively("diff", srcroot, diff_prov)
+
+    # Git Log
+    log_prov = os.path.join(exeroot, "GIT_LOG.{}".format(lid))
+    cmd = "log --first-parent --pretty=oneline -n 5"
+    _run_git_cmd_recursively(cmd, srcroot, log_prov)
+
+    # Git remote
+    remote_prov = os.path.join(exeroot, "GIT_REMOTE.{}".format(lid))
+    _run_git_cmd_recursively("remote -v", srcroot, remote_prov)
+
+    gitroot = _find_git_root(srcroot)
+    gitroot = _parse_dot_git_path(gitroot)
+
+    # Git config
+    config_src = os.path.join(gitroot, "config")
+    config_prov = os.path.join(exeroot, "GIT_CONFIG.{}".format(lid))
+    safe_copy(config_src, config_prov, preserve_meta=False)
+
 def _save_build_provenance_e3sm(case, lid):
-    cimeroot = case.get_value("CIMEROOT")
+    srcroot = case.get_value("SRCROOT")
     exeroot = case.get_value("EXEROOT")
     caseroot = case.get_value("CASEROOT")
 
     # Save git describe
     describe_prov = os.path.join(exeroot, "GIT_DESCRIBE.{}".format(lid))
-    desc = get_current_commit(tag=True, repo=cimeroot)
+    desc = get_current_commit(tag=True, repo=srcroot)
     with open(describe_prov, "w") as fd:
         fd.write(desc)
 
+    gitroot = _find_git_root(srcroot)
+
     # Save HEAD
-    headfile = os.path.join(cimeroot, ".git", "logs", "HEAD")
+    headfile = os.path.join(gitroot, "logs", "HEAD")
     headfile_prov = os.path.join(exeroot, "GIT_LOGS_HEAD.{}".format(lid))
     if os.path.exists(headfile_prov):
         os.remove(headfile_prov)
     if os.path.exists(headfile):
-        copy_umask(headfile, headfile_prov)
+        safe_copy(headfile, headfile_prov, preserve_meta=False)
+
+    # Save git submodule status
+    submodule_prov = os.path.join(exeroot, "GIT_SUBMODULE_STATUS.{}".format(lid))
+    subm_status = get_current_submodule_status(recursive=True, repo=srcroot)
+    with open(submodule_prov, "w") as fd:
+        fd.write(subm_status)
+
+    _record_git_provenance(srcroot, exeroot, lid)
 
     # Save SourceMods
     sourcemods = os.path.join(caseroot, "SourceMods")
@@ -63,9 +167,21 @@ def _save_build_provenance_e3sm(case, lid):
     env_module = case.get_env("mach_specific")
     env_module.save_all_env_info(env_prov)
 
+    # Save build times
+    build_times = os.path.join(exeroot, "build_times.{}.txt".format(lid))
+    if os.path.exists(build_times):
+        os.remove(build_times)
+    globstr = "{}/*bldlog*{}.gz".format(exeroot, lid)
+    matches = glob.glob(globstr)
+    if matches:
+        _extract_times(matches, build_times)
+
     # For all the just-created post-build provenance files, symlink a generic name
     # to them to indicate that these are the most recent or active.
-    for item in ["GIT_DESCRIBE", "GIT_LOGS_HEAD", "SourceMods", "build_environment"]:
+    for item in ["GIT_DESCRIBE", "GIT_LOGS_HEAD", "GIT_SUBMODULE_STATUS",
+                 "GIT_STATUS", "GIT_DIFF", "GIT_LOG", "GIT_CONFIG",
+                 "GIT_REMOTE", "SourceMods", "build_environment",
+                 "build_times"]:
         globstr = "{}/{}.{}*".format(exeroot, item, lid)
         matches = glob.glob(globstr)
         expect(len(matches) < 2, "Multiple matches for glob {} should not have happened".format(globstr))
@@ -135,7 +251,7 @@ def _save_prerun_timing_e3sm(case, lid):
     rundir = case.get_value("RUNDIR")
     blddir = case.get_value("EXEROOT")
     caseroot = case.get_value("CASEROOT")
-    cimeroot = case.get_value("CIMEROOT")
+    srcroot = case.get_value("SRCROOT")
     base_case = case.get_value("CASE")
     full_timing_dir = os.path.join(timing_dir, "performance_archive", getpass.getuser(), base_case, lid)
     if os.path.exists(full_timing_dir):
@@ -154,12 +270,7 @@ def _save_prerun_timing_e3sm(case, lid):
     # For some batch machines save queue info
     job_id = _get_batch_job_id_for_syslog(case)
     if job_id is not None:
-        if mach == "mira":
-            for cmd, filename in [("qstat -f", "qstatf"), ("qstat -lf %s" % job_id, "qstatf_jobid")]:
-                filename = "%s.%s" % (filename, lid)
-                run_cmd_no_fail(cmd, arg_stdout=filename, from_dir=full_timing_dir)
-                gzip_existing_file(os.path.join(full_timing_dir, filename))
-        elif mach == "theta":
+        if mach == "theta":
             for cmd, filename in [("qstat -l --header JobID:JobName:User:Project:WallTime:QueuedTime:Score:RunTime:TimeRemaining:Nodes:State:Location:Mode:Command:Args:Procs:Queue:StartTime:attrs:Geometry", "qstatf"),
                                   ("qstat -lf %s" % job_id, "qstatf_jobid"),
                                   ("xtnodestat", "xtnodestat"),
@@ -167,31 +278,26 @@ def _save_prerun_timing_e3sm(case, lid):
                 filename = "%s.%s" % (filename, lid)
                 run_cmd_no_fail(cmd, arg_stdout=filename, from_dir=full_timing_dir)
                 gzip_existing_file(os.path.join(full_timing_dir, filename))
-        elif mach in ["edison", "cori-haswell", "cori-knl"]:
-            for cmd, filename in [("sinfo -a -l", "sinfol"), ("sqs -f %s" % job_id, "sqsf_jobid"),
+        elif mach in ["cori-haswell", "cori-knl"]:
+            for cmd, filename in [("sinfo -a -l", "sinfol"), ("scontrol show jobid %s" % job_id, "sqsf_jobid"),
                                   # ("sqs -f", "sqsf"),
                                   ("squeue -o '%.10i %.15P %.20j %.10u %.7a %.2t %.6D %.8C %.10M %.10l %.20S %.20V'", "squeuef"),
                                   ("squeue -t R -o '%.10i %R'", "squeues")]:
                 filename = "%s.%s" % (filename, lid)
                 run_cmd_no_fail(cmd, arg_stdout=filename, from_dir=full_timing_dir)
                 gzip_existing_file(os.path.join(full_timing_dir, filename))
-        elif mach == "titan":
-            for cmd, filename in [("qstat -f %s >" % job_id, "qstatf_jobid"),
-                                  ("xtnodestat >", "xtnodestat"),
-                                  # ("qstat -f >", "qstatf"),
-                                  # ("xtdb2proc -f", "xtdb2proc"),
-                                  ("showq >", "showq")]:
-                full_cmd = cmd + " " + filename
-                run_cmd_no_fail(full_cmd + "." + lid, from_dir=full_timing_dir)
-                gzip_existing_file(os.path.join(full_timing_dir, filename + "." + lid))
-
-            # mdiag_reduce = os.path.join(full_timing_dir, "mdiag_reduce." + lid)
-            # run_cmd_no_fail("./mdiag_reduce.csh", arg_stdout=mdiag_reduce, from_dir=os.path.join(caseroot, "Tools"))
-            # gzip_existing_file(mdiag_reduce)
-        elif mach == "anvil":
-            for cmd, filename in [("qstat -f -1 acme >", "qstatf"),
-                                  ("qstat -f %s >" % job_id, "qstatf_jobid"),
-                                  ("qstat -r acme >", "qstatr")]:
+        elif mach in ["anvil", "chrysalis", "compy"]:
+            for cmd, filename in [("sinfo -l", "sinfol"), 
+                                  ("squeue -o '%all' --job {}".format(job_id), "squeueall_jobid"),
+                                  ("squeue -o '%.10i %.10P %.15u %.20a %.2t %.6D %.8C %.12M %.12l %.20S %.20V %j'", "squeuef"),
+                                  ("squeue -t R -o '%.10i %R'", "squeues")]:
+                filename = "%s.%s" % (filename, lid)
+                run_cmd_no_fail(cmd, arg_stdout=filename, from_dir=full_timing_dir)
+                gzip_existing_file(os.path.join(full_timing_dir, filename))
+        elif mach == "summit":
+            for cmd, filename in [("bjobs -u all >", "bjobsu_all"),
+                                  ("bjobs -r -u all -o 'jobid slots exec_host' >", "bjobsru_allo"),
+                                  ("bjobs -l -UF %s >" % job_id, "bjobslUF_jobid")]:
                 full_cmd = cmd + " " + filename
                 run_cmd_no_fail(full_cmd + "." + lid, from_dir=full_timing_dir)
                 gzip_existing_file(os.path.join(full_timing_dir, filename + "." + lid))
@@ -207,6 +313,7 @@ def _save_prerun_timing_e3sm(case, lid):
     os.mkdir(case_docs)
     globs_to_copy = [
         "CaseDocs/*",
+        "run_script_provenance/*",
         "*.run",
         ".*.run",
         "*.xml",
@@ -221,19 +328,20 @@ def _save_prerun_timing_e3sm(case, lid):
         ]
     for glob_to_copy in globs_to_copy:
         for item in glob.glob(os.path.join(caseroot, glob_to_copy)):
-            copy_umask(item, os.path.join(case_docs, "{}.{}".format(os.path.basename(item).lstrip("."), lid)))
+            safe_copy(item, os.path.join(case_docs, "{}.{}".format(os.path.basename(item).lstrip("."), lid)), preserve_meta=False)
 
     # Copy some items from build provenance
     blddir_globs_to_copy = [
         "GIT_LOGS_HEAD",
-        "build_environment.txt"
+        "build_environment.txt",
+        "build_times.txt"
         ]
     for blddir_glob_to_copy in blddir_globs_to_copy:
         for item in glob.glob(os.path.join(blddir, blddir_glob_to_copy)):
-            copy_umask(item, os.path.join(full_timing_dir, os.path.basename(item) + "." + lid))
+            safe_copy(item, os.path.join(full_timing_dir, os.path.basename(item) + "." + lid), preserve_meta=False)
 
     # Save state of repo
-    from_repo = cimeroot if os.path.exists(os.path.join(cimeroot, ".git")) else os.path.dirname(cimeroot)
+    from_repo = srcroot if os.path.exists(os.path.join(srcroot, ".git")) else os.path.dirname(srcroot)
     desc = get_current_commit(tag=True, repo=from_repo)
     with open(os.path.join(full_timing_dir, "GIT_DESCRIBE.{}".format(lid)), "w") as fd:
         fd.write(desc)
@@ -271,6 +379,23 @@ def _save_prerun_provenance_e3sm(case, lid):
 def _save_prerun_provenance_cesm(case, lid): # pylint: disable=unused-argument
     pass
 
+def _save_prerun_provenance_common(case, lid):
+    """ Saves common prerun provenance.
+    """
+    run_dir = case.get_value("RUNDIR")
+
+    base_preview_run = os.path.join(run_dir, "preview_run.log")
+    preview_run = f"{base_preview_run}.{lid}"
+
+    if os.path.exists(base_preview_run):
+        os.remove(base_preview_run)
+
+    with open(base_preview_run, "w") as fd:
+        case.preview_run(lambda x: fd.write("{}\n".format(x)), None)
+
+        # Create copy rather than symlink, the log is automatically gzipped
+        safe_copy(base_preview_run, preview_run)
+
 def save_prerun_provenance(case, lid=None):
     with SharedArea():
         # Always save env
@@ -280,6 +405,8 @@ def save_prerun_provenance(case, lid=None):
         if not os.path.isdir(logdir):
             os.makedirs(logdir)
         env_module.save_all_env_info(os.path.join(logdir, "run_environment.txt.{}".format(lid)))
+
+        _save_prerun_provenance_common(case, lid)
 
         model = case.get_value("MODEL")
         if model == "e3sm":
@@ -306,6 +433,29 @@ def _save_postrun_timing_e3sm(case, lid):
         tfd.add(rundir_timing_dir, arcname=os.path.basename(rundir_timing_dir))
 
     shutil.rmtree(rundir_timing_dir)
+
+    atm_chunk_costs_src_path = os.path.join(rundir, "atm_chunk_costs.txt")
+    if os.path.exists(atm_chunk_costs_src_path):
+        atm_chunk_costs_dst_path = os.path.join(rundir, "atm_chunk_costs.{}".format(lid))
+        shutil.move(atm_chunk_costs_src_path, atm_chunk_costs_dst_path)
+        gzip_existing_file(atm_chunk_costs_dst_path)
+
+    # gzip memory profile log
+    glob_to_copy = "memory.[0-4].*.log"
+    for item in glob.glob(os.path.join(rundir, glob_to_copy)):
+        mprof_dst_path = os.path.join(os.path.dirname(item), (os.path.basename(item) + ".{}").format(lid))
+        shutil.move(item, mprof_dst_path)
+        gzip_existing_file(mprof_dst_path)
+
+    # Copy Scorpio I/O performance stats to a separate dir + tar + compress
+    spio_stats_dir = os.path.join(rundir, "spio_stats." + lid)
+    os.mkdir(spio_stats_dir)
+    for item in glob.glob(os.path.join(rundir, "io_perf_summary*")):
+        safe_copy(item, spio_stats_dir)
+    with tarfile.open("%s.tar.gz" % spio_stats_dir, "w:gz") as tfd:
+        tfd.add(spio_stats_dir, arcname=os.path.basename(spio_stats_dir))
+
+    shutil.rmtree(spio_stats_dir)
 
     gzip_existing_file(os.path.join(caseroot, "timing", "e3sm_timing_stats.%s" % lid))
 
@@ -343,38 +493,47 @@ def _save_postrun_timing_e3sm(case, lid):
                 os.remove(syslog_jobid_path)
 
     # copy timings
-    copy_umask("%s.tar.gz" % rundir_timing_dir, full_timing_dir)
+    safe_copy("%s.tar.gz" % rundir_timing_dir, full_timing_dir, preserve_meta=False)
 
     #
     # save output files and logs
     #
     globs_to_copy = []
     if job_id is not None:
-        if mach == "titan":
-            globs_to_copy.append("%s*OU" % job_id)
-        elif mach == "anvil":
-            globs_to_copy.append("/home/%s/%s*OU" % (getpass.getuser(), job_id))
-        elif mach in ["mira", "theta"]:
+        if mach in ["anvil", "chrysalis", "compy", "cori-haswell", "cori-knl"]:
+            globs_to_copy.append("run*%s*%s" % (case.get_value("CASE"), job_id))
+        elif mach == "theta":
             globs_to_copy.append("%s*error" % job_id)
             globs_to_copy.append("%s*output" % job_id)
             globs_to_copy.append("%s*cobaltlog" % job_id)
-        elif mach in ["edison", "cori-haswell", "cori-knl"]:
-            globs_to_copy.append("%s*run*%s" % (case.get_value("CASE"), job_id))
+        elif mach == "summit":
+            globs_to_copy.append("e3sm.stderr.%s" % job_id)
+            globs_to_copy.append("e3sm.stdout.%s" % job_id)
 
     globs_to_copy.append("logs/run_environment.txt.{}".format(lid))
-    globs_to_copy.append("logs/e3sm.log.{}.gz".format(lid))
-    globs_to_copy.append("logs/cpl.log.{}.gz".format(lid))
+    globs_to_copy.append(os.path.join(rundir, "e3sm.log.{}.gz".format(lid)))
+    globs_to_copy.append(os.path.join(rundir, "cpl.log.{}.gz".format(lid)))
+    globs_to_copy.append(os.path.join(rundir, "atm_chunk_costs.{}.gz".format(lid)))
+    globs_to_copy.append(os.path.join(rundir, "memory.[0-4].*.log.{}.gz".format(lid)))
     globs_to_copy.append("timing/*.{}*".format(lid))
     globs_to_copy.append("CaseStatus")
+    globs_to_copy.append(os.path.join(rundir, "spio_stats.{}.tar.gz".format(lid)))
+    globs_to_copy.append(os.path.join(caseroot, "replay.sh"))
+    # Can't use a single glob, similar files e.g. {filename}.{lid} get picked up.
+    bld_filenames = ["GIT_STATUS", "GIT_DIFF", "GIT_LOG", "GIT_REMOTE",
+                     "GIT_CONFIG", "GIT_SUBMODULE_STATUS"]
+    bld_globs = map(lambda x: f"bld/{x}", bld_filenames)
+    globs_to_copy.extend(bld_globs)
+    globs_to_copy.append("run/preview_run.log")
 
     for glob_to_copy in globs_to_copy:
         for item in glob.glob(os.path.join(caseroot, glob_to_copy)):
             basename = os.path.basename(item)
             if basename != timing_saved_file:
                 if lid not in basename and not basename.endswith(".gz"):
-                    copy_umask(item, os.path.join(full_timing_dir, "{}.{}".format(basename, lid)))
+                    safe_copy(item, os.path.join(full_timing_dir, "{}.{}".format(basename, lid)), preserve_meta=False)
                 else:
-                    copy_umask(item, full_timing_dir)
+                    safe_copy(item, full_timing_dir, preserve_meta=False)
 
     # zip everything
     for root, _, files in os.walk(full_timing_dir):
@@ -407,7 +566,7 @@ def get_recommended_test_time_based_on_past(baseline_root, test, raw=False):
         try:
             the_path = os.path.join(baseline_root, _WALLTIME_BASELINE_NAME, test, _WALLTIME_FILE_NAME)
             if os.path.exists(the_path):
-                last_line = int(open(the_path, "r").readlines()[-1])
+                last_line = int(open(the_path, "r").readlines()[-1].split()[0])
                 if raw:
                     best_walltime = last_line
                 else:
@@ -423,22 +582,112 @@ def get_recommended_test_time_based_on_past(baseline_root, test, raw=False):
                     best_walltime += _GLOBAL_WIGGLE
 
                 return convert_to_babylonian_time(best_walltime)
-        except:
+        except Exception:
             # We NEVER want a failure here to kill the run
-            logger.warning("Failed to read test time: {}".format(sys.exc_info()[0]))
+            logger.warning("Failed to read test time: {}".format(sys.exc_info()[1]))
 
     return None
 
-def save_test_time(baseline_root, test, time_seconds):
+def save_test_time(baseline_root, test, time_seconds, commit):
     if baseline_root is not None:
         try:
-            the_dir  = os.path.join(baseline_root, _WALLTIME_BASELINE_NAME, test)
-            if not os.path.exists(the_dir):
-                os.makedirs(the_dir)
+            with SharedArea():
+                the_dir = os.path.join(baseline_root, _WALLTIME_BASELINE_NAME, test)
+                if not os.path.exists(the_dir):
+                    os.makedirs(the_dir)
 
-            the_path = os.path.join(the_dir, _WALLTIME_FILE_NAME)
-            with open(the_path, "a") as fd:
-                fd.write("{}\n".format(int(time_seconds)))
-        except:
+                the_path = os.path.join(the_dir, _WALLTIME_FILE_NAME)
+                with open(the_path, "a") as fd:
+                    fd.write("{} {}\n".format(int(time_seconds), commit))
+
+        except Exception:
             # We NEVER want a failure here to kill the run
-            logger.warning("Failed to store test time: {}".format(sys.exc_info()[0]))
+            logger.warning("Failed to store test time: {}".format(sys.exc_info()[1]))
+
+_SUCCESS_BASELINE_NAME = "success-history"
+_SUCCESS_FILE_NAME     = "last-transitions"
+
+def _read_success_data(baseline_root, test):
+    success_path = os.path.join(baseline_root, _SUCCESS_BASELINE_NAME, test, _SUCCESS_FILE_NAME)
+    if os.path.exists(success_path):
+        with open(success_path, "r") as fd:
+            prev_results_raw = fd.read().strip()
+            prev_results = prev_results_raw.split()
+            expect(len(prev_results) == 2, "Bad success data: '{}'".format(prev_results_raw))
+    else:
+        prev_results = ["None", "None"]
+
+    # Convert "None" to None
+    for idx, item in enumerate(prev_results):
+        if item == "None":
+            prev_results[idx] = None
+
+    return success_path, prev_results
+
+def _is_test_working(prev_results, src_root, testing=False):
+    # If there is no history of success, prev run could not have succeeded and vice versa for failures
+    if prev_results[0] is None:
+        return False
+    elif prev_results[1] is None:
+        return True
+    else:
+        if not testing:
+            stat, out, err = run_cmd("git merge-base --is-ancestor {}".format(" ".join(prev_results)), from_dir=src_root)
+            expect(stat in [0, 1], "Unexpected status from ancestor check:\n{}\n{}".format(out, err))
+        else:
+            # Hack for testing
+            stat = 0 if prev_results[0] < prev_results[1] else 1
+
+        # stat == 0 tells us that pass is older than fail, so we must have failed, otherwise we passed
+        return stat != 0
+
+def get_test_success(baseline_root, src_root, test, testing=False):
+    """
+    Returns (was prev run success, commit when test last passed, commit when test last transitioned from pass to fail)
+
+    Unknown history is expressed as None
+    """
+    if baseline_root is not None:
+        try:
+            prev_results = _read_success_data(baseline_root, test)[1]
+            prev_success = _is_test_working(prev_results, src_root, testing=testing)
+            return prev_success, prev_results[0], prev_results[1]
+
+        except Exception:
+            # We NEVER want a failure here to kill the run
+            logger.warning("Failed to read test success: {}".format(sys.exc_info()[1]))
+
+    return False, None, None
+
+def save_test_success(baseline_root, src_root, test, succeeded, force_commit_test=None):
+    """
+    Update success data accordingly based on succeeded flag
+    """
+    if baseline_root is not None:
+        try:
+            with SharedArea():
+                success_path, prev_results = _read_success_data(baseline_root, test)
+
+                the_dir = os.path.dirname(success_path)
+                if not os.path.exists(the_dir):
+                    os.makedirs(the_dir)
+
+                prev_succeeded = _is_test_working(prev_results, src_root, testing=(force_commit_test is not None))
+
+                # if no transition occurred then no update is needed
+                if succeeded or succeeded != prev_succeeded or (prev_results[0] is None and succeeded) or (prev_results[1] is None and not succeeded):
+
+                    new_results = list(prev_results)
+                    my_commit = force_commit_test if force_commit_test else get_current_commit(repo=src_root)
+                    if succeeded:
+                        new_results[0] = my_commit # we passed
+                    else:
+                        new_results[1] = my_commit # we transitioned to a failing state
+
+                    str_results = ["None" if item is None else item for item in new_results]
+                    with open(success_path, "w") as fd:
+                        fd.write("{}\n".format(" ".join(str_results)))
+
+        except Exception:
+            # We NEVER want a failure here to kill the run
+            logger.warning("Failed to store test success: {}".format(sys.exc_info()[1]))

@@ -1,4 +1,4 @@
-#/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 This module contains unit tests of CaseFake
@@ -37,3 +37,5 @@ class TestCaseFake(unittest.TestCase):
         self.assertEqual(os.path.join(new_caseroot, 'run'),
                          clone.get_value('RUNDIR'))
 
+if __name__ == '__main__':
+    unittest.main()

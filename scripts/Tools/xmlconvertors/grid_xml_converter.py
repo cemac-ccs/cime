@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 grid_xml_converter.py -- convert (or verify) grid elements from CIME2 format
 to CIME5. This tool will compare the two versions and suggest updates
@@ -116,7 +116,7 @@ class GridmapNode(DataNode):
         self.data['maps'] = {}
         self.xmlnode = xmlnode
         for k in ['atm_grid', 'lnd_grid', 'ocn_grid', 'rof_grid', 'glc_grid',
-                  'wav_grid', 'ice_grid']:
+                  'wav_grid', 'ice_grid', 'iac_grid' ]:
             att = xmlnode.get(k)
             if att is not None:
                 self.data[k] = att.strip()
