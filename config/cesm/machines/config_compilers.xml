@@ -728,8 +728,10 @@ some of above SLIBS might be superfluous.
 
 <compiler MACH="archer2" COMPILER="gnu">
   <FFLAGS>
-    <append>  -mcmodel=medium -std=legacy -fcray-pointer -fallow-argument-mismatch -march=znver2 </append>
-    <append>  -fallow-invalid-boz -fconvert=big-endian -fconvert=big-endian -ffree-line-length-none -ffixed-line-length-none</append>
+    <append>  -mcmodel=medium -std=legacy -fcray-pointer </append>
+    <append>  -fallow-argument-mismatch -fallow-invalid-boz </append>
+    <append>  -fconvert=big-endian -fconvert=big-endian -ffree-line-length-none -ffixed-line-length-none</append>
+    <!--<append>  -O2 -ftree-vectorize -ffast-math </append>-->
   </FFLAGS>
   <CFLAGS>
     <append>  -mcmodel=medium -march=znver2 </append>
@@ -738,7 +740,7 @@ some of above SLIBS might be superfluous.
     <append> -ldl </append>
   </SLIBS>
 </compiler>
-
+    
 <compiler MACH="athena">
   <CPPDEFS>
     <!-- these flags enable nano timers -->
