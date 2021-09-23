@@ -117,13 +117,13 @@ This allows using a different mpirun command to launch unit tests
 
   <machine MACH="archer2">
     <DESC>two CrayAMD EPYC Zen2, 128 pes/node, batch system is SLURM</DESC>
-    <NODENAME_REGEX>.*</NODENAME_REGEX>
+    <NODENAME_REGEX>(uan\d{2}$|nid\d{5}$)</NODENAME_REGEX>
     <OS>CNL</OS>
     <COMPILERS>gnu,cray</COMPILERS>
     <MPILIBS>mpich,mpi-serial</MPILIBS>
     <!-- <PROJECT>ta004</PROJECT> 
     <CESM_LOC>/work/n02/n02/$ENV{USER}/cesm/CESM2.1.3</CESM_LOC>-->
-    <CIME_OUTPUT_ROOT>/work/n02/n02/$ENV{USER}/cesm/CESM2.1.3/runs</CIME_OUTPUT_ROOT>
+    <CIME_OUTPUT_ROOT>/work/n02/n02/$ENV{USER}/cesm/CESM2.1.3:/runs</CIME_OUTPUT_ROOT>
     <DIN_LOC_ROOT>/work/n02/n02/$ENV{USER}/cesm/CESM2.1.3/cesm_inputdata</DIN_LOC_ROOT>
     <DIN_LOC_ROOT_CLMFORC>/work/n02/n02/$ENV{USER}/cesm/CESM2.1.3/cesm_inputdata/atm/datm7</DIN_LOC_ROOT_CLMFORC>
     <DOUT_S_ROOT>/work/n02/n02/$ENV{USER}/cesm/CESM2.1.3/archive/$CASE</DOUT_S_ROOT>
@@ -132,8 +132,8 @@ This allows using a different mpirun command to launch unit tests
     <GMAKE_J>8</GMAKE_J>
     <BATCH_SYSTEM>slurm</BATCH_SYSTEM>
     <SUPPORTED_BY>mjm at- ed.ac.uk</SUPPORTED_BY>
-    <MAX_TASKS_PER_NODE>64</MAX_TASKS_PER_NODE>
-    <MAX_MPITASKS_PER_NODE>64</MAX_MPITASKS_PER_NODE>
+    <MAX_TASKS_PER_NODE>128</MAX_TASKS_PER_NODE>
+    <MAX_MPITASKS_PER_NODE>128</MAX_MPITASKS_PER_NODE>
     <mpirun mpilib="default">
       <executable>srun</executable>
       <arguments>
@@ -167,7 +167,13 @@ This allows using a different mpirun command to launch unit tests
 
     <environment_variables>
       <env name="OMP_STACKSIZE">256M</env>
+      <env name="NETCDF_PATH">$ENV{NETCDF_DIR}</env>
+      <env name="PATH">/work/n02/shared/CESM2/UEdin/sw/conda/cesm_envir1/bin:$ENV{PATH}</env>
     </environment_variables>
+    <resource_limits>
+      <resource name="RLIMIT_STACK">-1</resource>
+    </resource_limits>
+
 
   </machine>
 
