@@ -1337,6 +1337,42 @@ using a fortran linker.
   <MPIFC>mpiifort</MPIFC>
 </compiler>
 
+<compiler MACH="archer2">
+  <PIO_FILESYSTEM_HINTS>lustre</PIO_FILESYSTEM_HINTS>
+  <NETCDF_PATH>$ENV{NETCDF_PREFIX}</NETCDF_PATH>
+  <PNETCDF_PATH  MPILIB="mpich">$ENV{PNETCDF_PREFIX}</PNETCDF_PATH>
+
+  <LDFLAGS>
+     <append MPILIB="mpich"> -dynamic -L${NETCDF_PATH}/lib -lnetcdff -lnetcdf  -Wl,-rpath,${NETCDF_PATH}/lib </append>
+     <append MPILIB="mpich"> -L${PNETCDF_PATH}/lib -lpnetcdf -Wl,-rpath,${PNETCDF_PATH}/lib </append>
+  </LDFLAGS>
+
+  <SLIBS>
+     <append MPILIB="mpi-serial"> -L${NETCDF_PATH}/lib -lnetcdff -lnetcdf -Wl,-rpath,${NETCDF_PATH}/lib </append>
+  </SLIBS>
+<!--
+  <SLIBS>
+some of above SLIBS might be superfluous.
+   <append> -Wl,-rpath,${NETCDF_PATH}/lib </append>
+  </SLIBS>
+-->
+</compiler>
+<!-- still checking if folling are all correct and sufficient -->
+<compiler MACH="archer2" COMPILER="gnu">
+  <FFLAGS>
+    <append>  -mcmodel=medium -std=legacy -fcray-pointer </append>
+    <append>  -fallow-argument-mismatch -fallow-invalid-boz </append>
+    <append>  -fconvert=big-endian -fconvert=big-endian -ffree-line-length-none -ffixed-line-length-none</append>
+    <!--<append>  -O2 -ftree-vectorize -ffast-math </append>-->
+  </FFLAGS>
+  <CFLAGS>
+    <append>  -mcmodel=medium</append>
+  </CFLAGS>
+   <SLIBS>
+    <append> -ldl </append>
+  </SLIBS>
+</compiler>
+
 <compiler MACH="userdefined">
   <CONFIG_ARGS>
     <base/>
