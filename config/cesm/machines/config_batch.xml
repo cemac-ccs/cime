@@ -189,19 +189,25 @@
     <directives queue="standard">
       <directive>--partition=standard</directive>
       <directive>--qos=standard</directive>
+      <directive>--export=none</directive>
     </directives>
 
     <directives queue="short">
       <directive>--partition=standard</directive>
       <directive>--qos=short</directive>
-      <directive>--reservation=shortqos</directive>
+      <directive>--export=none</directive>
     </directives>
 
-    <!-- following will need updating as system develops -->
+    <directives queue="serial">
+      <directive>--partition=serial</directive>
+      <directive>--qos=serial</directive>
+      <directive>--export=none</directive>
+    </directives>
+
     <queues>
-      <queue walltimemax="24:00:00" nodemin="1" nodemax="2712" default="true">standard</queue>
-      <!-- <queue walltimemin="24:00:00" walltimemax="48:00:00" nodemin="1" nodemax="64" >long</queue> -->
-      <queue walltimemax="00:20:00" nodemin="1" nodemax="4">short</queue>
+      <queue walltimemax="24:00:00" nodemin="1" nodemax="1024" default="true">standard</queue>
+      <queue walltimemax="00:20:00" nodemin="1" nodemax="32">short</queue>
+      <queue walltimemax="24:00:00" nodemin="1" nodemax="1">serial</queue>
     </queues>
   </batch_system>
 
